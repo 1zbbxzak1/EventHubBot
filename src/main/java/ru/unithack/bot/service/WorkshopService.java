@@ -9,6 +9,7 @@ import org.springframework.transaction.annotation.Transactional;
 import ru.unithack.bot.domain.model.User;
 import ru.unithack.bot.domain.model.Workshop;
 import ru.unithack.bot.domain.model.WorkshopRegistration;
+import ru.unithack.bot.infrastructure.repository.UserRepository;
 import ru.unithack.bot.infrastructure.repository.WorkshopRegistrationRepository;
 import ru.unithack.bot.infrastructure.repository.WorkshopRepository;
 
@@ -28,14 +29,17 @@ public class WorkshopService {
     private final WorkshopRepository workshopRepository;
     private final WorkshopRegistrationRepository registrationRepository;
     private final NotificationService notificationService;
+    private final UserRepository userRepository;
 
     @Autowired
     public WorkshopService(WorkshopRepository workshopRepository,
                            WorkshopRegistrationRepository registrationRepository,
-                           NotificationService notificationService) {
+                           NotificationService notificationService,
+                           UserRepository userRepository) {
         this.workshopRepository = workshopRepository;
         this.registrationRepository = registrationRepository;
         this.notificationService = notificationService;
+        this.userRepository = userRepository;
     }
 
     @Transactional
@@ -527,5 +531,82 @@ public class WorkshopService {
                 workshop.getStartTime().format(DATE_TIME_FORMATTER),
                 workshop.getCapacity() - registeredCount,
                 workshop.getCapacity());
+    }
+
+    /**
+     * Помечает посещение участника на мастер-классе
+     * @param workshop мастер-класс
+     * @param user участник
+     * @param attended статус посещения (true - присутствовал, false - не присутствовал)
+     * @param markedByUserId ID пользователя (организатора), отметившего посещение
+     * @return true если успешно, false если пользователь не зарегистрирован на мастер-класс
+     */
+    @Transactional
+    public boolean markAttendance(Workshop workshop, User user, boolean attended, Long markedByUserId) {
+        Optional<WorkshopRegistration> registrationOpt = registrationRepository.findByWorkshopAndUser(workshop, user);
+        if (registrationOpt.isEmpty()) {
+            logger.info("Cannot mark attendance - user {} is not registered for workshop {}", 
+                user.getId(), workshop.getId());
+            return false;
+        }
+
+        // Игнорируем участников из листа ожидания
+        WorkshopRegistration registration = registrationOpt.get();
+        if (registration.isWaitlist()) {
+            logger.info("Cannot mark attendance - user {} is on waitlist for workshop {}", 
+                user.getId(), workshop.getId());
+            return false;
+        }
+        
+        // Обновляем статус посещения
+        registration.setAttended(attended);
+        
+        if (attended) {
+            registration.setAttendanceTime(LocalDateTime.now());
+        } else {
+            registration.setAttendanceTime(null);
+        }
+        
+        registration.setMarkedByUserId(markedByUserId);
+        registrationRepository.save(registration);
+        
+        logger.info("Marked user {} as {} for workshop {}, marked by user {}", 
+            user.getId(), 
+            attended ? "attended" : "not attended", 
+            workshop.getId(),
+            markedByUserId);
+        
+        return true;
+    }
+
+    /**
+     * Находит пользователя по содержимому QR-кода
+     * @param qrContent содержимое QR-кода
+     * @return найденный пользователь или пустой Optional
+     */
+    @Transactional(readOnly = true)
+    public Optional<User> findUserByQrContent(String qrContent) {
+        try {
+            // Формат QR-кода: "ID:USER_ID:NAME:CHAT_ID"
+            String[] parts = qrContent.split(":", 4);
+            if (parts.length >= 2 && "ID".equals(parts[0])) {
+                Long userId = Long.parseLong(parts[1]);
+                return Optional.of(userId)
+                    .flatMap(id -> userRepository.findById(id));
+            }
+        } catch (Exception e) {
+            logger.error("Error parsing QR code content: {}", qrContent, e);
+        }
+        return Optional.empty();
+    }
+    
+    /**
+     * Получает список участников мастер-класса с их статусом посещения
+     * @param workshop мастер-класс
+     * @return список участников с информацией о посещении
+     */
+    @Transactional(readOnly = true)
+    public List<WorkshopRegistration> getWorkshopAttendance(Workshop workshop) {
+        return registrationRepository.findByWorkshopAndWaitlistFalseOrderByRegistrationTimeAsc(workshop);
     }
 } 

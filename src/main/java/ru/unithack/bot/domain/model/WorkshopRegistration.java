@@ -35,6 +35,15 @@ public class WorkshopRegistration {
     
     @Column
     private Integer waitlistPosition;
+    
+    @Column(nullable = false)
+    private boolean attended = false;
+    
+    @Column
+    private LocalDateTime attendanceTime;
+    
+    @Column
+    private Long markedByUserId;
 
     public WorkshopRegistration() {
         this.registrationTime = LocalDateTime.now();
@@ -104,6 +113,30 @@ public class WorkshopRegistration {
         this.waitlistPosition = waitlistPosition;
     }
 
+    public boolean isAttended() {
+        return attended;
+    }
+
+    public void setAttended(boolean attended) {
+        this.attended = attended;
+    }
+
+    public LocalDateTime getAttendanceTime() {
+        return attendanceTime;
+    }
+
+    public void setAttendanceTime(LocalDateTime attendanceTime) {
+        this.attendanceTime = attendanceTime;
+    }
+
+    public Long getMarkedByUserId() {
+        return markedByUserId;
+    }
+
+    public void setMarkedByUserId(Long markedByUserId) {
+        this.markedByUserId = markedByUserId;
+    }
+
     @Override
     public int hashCode() {
         return Objects.hash(id);
@@ -128,6 +161,9 @@ public class WorkshopRegistration {
                 ", pendingConfirmation=" + pendingConfirmation +
                 ", confirmationDeadline=" + confirmationDeadline +
                 ", waitlistPosition=" + waitlistPosition +
+                ", attended=" + attended +
+                ", attendanceTime=" + attendanceTime +
+                ", markedByUserId=" + markedByUserId +
                 '}';
     }
 } 

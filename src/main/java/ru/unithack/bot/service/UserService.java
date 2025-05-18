@@ -146,4 +146,9 @@ public class UserService {
     public boolean hasRole(Long userId, UserRole userRole) {
         return roleService.hasRole(userId, userRole);
     }
+
+    @Transactional(readOnly = true)
+    public Optional<User> findUserById(Long userId) {
+        return userRepository.findById(userId);
+    }
 } 

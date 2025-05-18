@@ -5,6 +5,9 @@ import com.pengrad.telegrambot.UpdatesListener;
 import com.pengrad.telegrambot.model.Message;
 import com.pengrad.telegrambot.model.Update;
 import com.pengrad.telegrambot.model.User;
+import com.pengrad.telegrambot.model.request.InlineKeyboardButton;
+import com.pengrad.telegrambot.model.request.InlineKeyboardMarkup;
+import com.pengrad.telegrambot.model.request.ParseMode;
 import com.pengrad.telegrambot.request.SendMessage;
 import com.pengrad.telegrambot.request.SendPhoto;
 import jakarta.annotation.PostConstruct;
@@ -23,7 +26,6 @@ import ru.unithack.bot.infrastructure.repository.UserRepository;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
-import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 
@@ -33,9 +35,13 @@ public class TelegramBotService {
     private static final Logger logger = LoggerFactory.getLogger(TelegramBotService.class);
     private static final DateTimeFormatter DATE_FORMATTER = DateTimeFormatter.ofPattern("dd.MM.yyyy");
     private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ofPattern("HH:mm");
+    private static final DateTimeFormatter DATE_TIME_FORMATTER = DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm");
 
     @Value("${app.telegram-token}")
     private String telegramToken;
+    
+    @Value("${app.telegram-bot-username:your_bot}")
+    private String botUsername;
 
     private TelegramBot telegramBot;
     private final UserService userService;
@@ -72,10 +78,80 @@ public class TelegramBotService {
 
     private void processUpdates(List<Update> updates) {
         for (Update update : updates) {
-            if (update.message() != null && update.message().text() != null) {
-                processMessage(update.message());
+            try {
+                if (update.message() != null && update.message().text() != null) {
+                    processMessage(update.message());
+                } else if (update.callbackQuery() != null) {
+                    processCallbackQuery(update);
+                }
+            } catch (Exception e) {
+                logger.error("Error processing update", e);
             }
         }
+    }
+
+    /**
+     * Обрабатывает нажатия на inline-кнопки
+     */
+    private void processCallbackQuery(Update update) {
+        String callbackData = update.callbackQuery().data();
+        Long chatId = update.callbackQuery().from().id();
+        
+        logger.info("Received callback: {} from chatId: {}", callbackData, chatId);
+        
+        if (callbackData.startsWith("mark_attendance:")) {
+            // Формат: mark_attendance:workshop_id:user_id:status
+            String[] parts = callbackData.split(":");
+            if (parts.length >= 4) {
+                try {
+                    Long workshopId = Long.parseLong(parts[1]);
+                    Long userId = Long.parseLong(parts[2]);
+                    boolean status = Boolean.parseBoolean(parts[3]);
+                    
+                    markAttendanceFromCallback(chatId, workshopId, userId, status);
+                } catch (Exception e) {
+                    logger.error("Error processing mark_attendance callback", e);
+                    sendMessage(chatId, "Ошибка при обработке запроса на отметку посещения");
+                }
+            }
+        }
+    }
+    
+    /**
+     * Обрабатывает отметку посещения из колбэка кнопки
+     */
+    private void markAttendanceFromCallback(Long organizerChatId, Long workshopId, Long userId, boolean status) {
+        userService.findUserByChatId(organizerChatId).ifPresentOrElse(
+                organizer -> {
+                    if (!(userService.hasRole(organizer.getId(), UserRole.ORGANIZER) ||
+                            userService.hasRole(organizer.getId(), UserRole.ADMIN))) {
+                        sendMessage(organizerChatId, "У вас нет прав на выполнение этой команды");
+                        return;
+                    }
+                    
+                    workshopService.getWorkshopById(workshopId).ifPresentOrElse(
+                            workshop -> {
+                                userService.findUserById(userId).ifPresentOrElse(
+                                        participant -> {
+                                            boolean success = workshopService.markAttendance(workshop, participant, status, organizer.getId());
+                                            if (success) {
+                                                String statusMsg = status ? "✅ отмечен как присутствующий" : "❌ отмечен как отсутствующий";
+                                                sendMessage(organizerChatId, String.format("Участник %s %s на мастер-классе \"%s\"",
+                                                        participant.getUserInfo().getName(),
+                                                        statusMsg,
+                                                        workshop.getTitle()));
+                                            } else {
+                                                sendMessage(organizerChatId, "Не удалось отметить посещение. Проверьте, зарегистрирован ли участник на мастер-класс");
+                                            }
+                                        },
+                                        () -> sendMessage(organizerChatId, "Пользователь не найден")
+                                );
+                            },
+                            () -> sendMessage(organizerChatId, "Мастер-класс не найден")
+                    );
+                },
+                () -> sendMessage(organizerChatId, "Вы не зарегистрированы в системе")
+        );
     }
 
     @Transactional
@@ -90,7 +166,7 @@ public class TelegramBotService {
         updateUserInfoIfChanged(chatId, fullName, username);
 
         if (text.startsWith("/start")) {
-            processStartCommand(telegramUser, chatId, fullName, username);
+            processStartCommand(telegramUser, chatId, fullName, username, text);
         } else if (text.startsWith("/add_organizer")) {
             processAddOrganizerCommand(chatId, text);
         } else if (text.startsWith("/remove_organizer")) {
@@ -129,6 +205,12 @@ public class TelegramBotService {
             processRemoveParticipantCommand(chatId, text);
         } else if (text.startsWith("/confirm_workshop")) {
             processConfirmWorkshopCommand(chatId, text);
+        } else if (text.startsWith("/scan_qr")) {
+            processScanQrCommand(chatId, text);
+        } else if (text.startsWith("/mark_attendance")) {
+            processMarkAttendanceCommand(chatId, text);
+        } else if (text.startsWith("/workshop_attendance")) {
+            processWorkshopAttendanceCommand(chatId, text);
         } else {
             userService.findUserByChatId(chatId).ifPresentOrElse(
                     user -> {
@@ -160,6 +242,9 @@ public class TelegramBotService {
                             commandsBuilder.append("/workshop_participants <id> - Список участников мастер-класса\n");
                             commandsBuilder.append("/add_participant <workshop_id> - Добавить участника\n");
                             commandsBuilder.append("/remove_participant <workshop_id> - Удалить участника\n");
+                            commandsBuilder.append("/scan_qr - Сканировать QR-код участника\n");
+                            commandsBuilder.append("/mark_attendance <workshop_id>|<user_id>|<status> - Отметить посещение участника\n");
+                            commandsBuilder.append("/workshop_attendance <id> - Показать отчет о посещении мастер-класса\n");
                         }
 
                         // Commands only for ADMIN
@@ -204,7 +289,14 @@ public class TelegramBotService {
         });
     }
 
-    private void processStartCommand(User telegramUser, Long chatId, String fullName, String username) {
+    private void processStartCommand(User telegramUser, Long chatId, String fullName, String username, String text) {
+        // Проверяем наличие параметра attendance в команде /start
+        if (text != null && text.startsWith("/start attendance_")) {
+            // Обрабатываем QR-код для отметки посещения
+            processAttendanceQrScan(chatId, text);
+            return;
+        }
+        
         String qrCode = UUID.randomUUID().toString();
 
         userService.findUserByChatId(chatId).ifPresentOrElse(
@@ -217,6 +309,92 @@ public class TelegramBotService {
                     }
                     sendMessage(chatId, "Вы успешно зарегистрированы как пользователь!");
                 }
+        );
+    }
+
+    /**
+     * Обрабатывает QR-код для отметки посещения
+     */
+    private void processAttendanceQrScan(Long organizerChatId, String startCommand) {
+        userService.findUserByChatId(organizerChatId).ifPresentOrElse(
+                organizer -> {
+                    if (!(userService.hasRole(organizer.getId(), UserRole.ORGANIZER) ||
+                            userService.hasRole(organizer.getId(), UserRole.ADMIN))) {
+                        sendMessage(organizerChatId, "У вас нет прав на выполнение этой команды. Требуется роль организатора или администратора.");
+                        return;
+                    }
+                    
+                    try {
+                        // Извлекаем ID пользователя из параметра
+                        String param = startCommand.substring("/start attendance_".length()).trim();
+                        Long userId = Long.parseLong(param);
+                        
+                        // Находим пользователя по ID
+                        userService.findUserById(userId).ifPresentOrElse(
+                                participant -> {
+                                    UserInfo userInfo = participant.getUserInfo();
+                                    if (userInfo != null) {
+                                        // Получаем список мастер-классов, на которые записан пользователь
+                                        List<WorkshopRegistration> registrations = workshopService.getUserRegistrations(participant)
+                                                .stream()
+                                                .filter(reg -> !reg.isWaitlist())
+                                                .toList();
+
+                                        if (registrations.isEmpty()) {
+                                            sendMessage(organizerChatId, String.format(
+                                                    "✅ QR код отсканирован!\n\n" +
+                                                    "👤 %s\n" +
+                                                    "🆔 ID: %d\n\n" +
+                                                    "❌ Пользователь не записан ни на один мастер-класс.",
+                                                    userInfo.getName(),
+                                                    userId
+                                            ));
+                                            return;
+                                        }
+
+                                        StringBuilder sb = new StringBuilder();
+                                        sb.append("✅ QR код отсканирован!\n\n")
+                                                .append("👤 ").append(userInfo.getName()).append("\n");
+                                                
+                                        if (userInfo.getUsername() != null && !userInfo.getUsername().isEmpty()) {
+                                            sb.append("👤 @").append(userInfo.getUsername()).append("\n");
+                                        }
+                                        
+                                        sb.append("🆔 ID: ").append(userId).append("\n\n")
+                                                .append("Выберите мастер-класс для отметки посещения:\n\n");
+
+                                        for (WorkshopRegistration reg : registrations) {
+                                            Workshop workshop = reg.getWorkshop();
+                                            String attendanceStatus = reg.isAttended() ? "✅ Присутствовал" : "❌ Не отмечен";
+                                            sb.append(String.format(
+                                                    "%d. %s\n%s\nСтатус: %s\n\n",
+                                                    workshop.getId(),
+                                                    workshop.getTitle(),
+                                                    workshop.getStartTime().format(DATE_TIME_FORMATTER),
+                                                    attendanceStatus
+                                            ));
+                                        }
+
+                                        sb.append("Для быстрой отметки присутствия используйте команду:\n")
+                                                .append("/mark_attendance ")
+                                                .append(registrations.get(0).getWorkshop().getId())
+                                                .append("|")
+                                                .append(userId)
+                                                .append("|true");
+
+                                        sendMessage(organizerChatId, sb.toString());
+                                    } else {
+                                        sendMessage(organizerChatId, "Пользователь найден, но информация о нем отсутствует.");
+                                    }
+                                },
+                                () -> sendMessage(organizerChatId, "Пользователь с ID " + userId + " не найден.")
+                        );
+                    } catch (Exception e) {
+                        logger.error("Error processing attendance QR scan", e);
+                        sendMessage(organizerChatId, "Ошибка при обработке QR-кода: " + e.getMessage());
+                    }
+                },
+                () -> sendMessage(organizerChatId, "Вы не зарегистрированы. Используйте /start для регистрации.")
         );
     }
 
@@ -431,6 +609,9 @@ public class TelegramBotService {
                         commandsBuilder.append("/workshop_participants <id> - Список участников мастер-класса\n");
                         commandsBuilder.append("/add_participant <workshop_id>|<user_chatId>|<waitlist> - Добавить участника\n");
                         commandsBuilder.append("/remove_participant <workshop_id>|<user_chatId> - Удалить участника\n");
+                        commandsBuilder.append("/scan_qr - Сканировать QR-код участника\n");
+                        commandsBuilder.append("/mark_attendance <workshop_id>|<user_id>|<status> - Отметить посещение участника\n");
+                        commandsBuilder.append("/workshop_attendance <id> - Показать отчет о посещении мастер-класса\n");
                     }
 
                     // Commands only for ADMIN
@@ -440,7 +621,7 @@ public class TelegramBotService {
                         commandsBuilder.append("/remove_organizer <chatId> - Удалить организатора\n");
                         commandsBuilder.append("/list_users - Список пользователей\n");
                     }
-                    
+
                     // System info about waitlists
                     commandsBuilder.append("\nИнформация о листе ожидания:\n");
                     commandsBuilder.append("✓ Если места на мастер-класс закончились, вы можете записаться в лист ожидания\n");
@@ -448,6 +629,18 @@ public class TelegramBotService {
                     commandsBuilder.append("✓ При освобождении места первый человек в очереди получит уведомление\n");
                     commandsBuilder.append("✓ У вас будет 15 минут на подтверждение участия через команду /confirm_workshop\n");
                     commandsBuilder.append("✓ Если вы не подтвердите участие вовремя, место будет предложено следующему\n");
+                    
+                    // Information about attendance tracking system
+                    if (userService.hasRole(user.getId(), UserRole.ORGANIZER) ||
+                            userService.hasRole(user.getId(), UserRole.ADMIN)) {
+                        commandsBuilder.append("\nОтслеживание посещаемости:\n");
+                        commandsBuilder.append("✓ Для отметки посещения отсканируйте QR-код участника обычным сканером\n");
+                        commandsBuilder.append("✓ QR-код содержит ссылку, которая автоматически откроется в Telegram\n");
+                        commandsBuilder.append("✓ После сканирования вы получите информацию о пользователе и его мастер-классах\n");
+                        commandsBuilder.append("✓ Вы сможете отметить посещение, нажав на предложенную команду\n");
+                        commandsBuilder.append("✓ Также можно вручную отметить посещение командой /mark_attendance\n");
+                        commandsBuilder.append("✓ Для просмотра отчетов используйте команду /workshop_attendance <id>\n");
+                    }
 
                     sendMessage(chatId, commandsBuilder.toString());
                 },
@@ -597,9 +790,9 @@ public class TelegramBotService {
                         int registeredCount = (int) data[1];
                         boolean isWaitlist = (boolean) data[3];
                         Integer waitlistPosition = (Integer) data[4];
-                        
+
                         sb.append(workshopService.formatWorkshopListItemSafe(workshop, registeredCount));
-                        
+
                         if (isWaitlist) {
                             if (waitlistPosition != null) {
                                 sb.append(String.format(" (в листе ожидания, позиция: %d)", waitlistPosition));
@@ -607,7 +800,7 @@ public class TelegramBotService {
                                 sb.append(" (в листе ожидания)");
                             }
                         }
-                        
+
                         sb.append("\n");
                     }
 
@@ -725,7 +918,7 @@ public class TelegramBotService {
                     try {
                         String idPart = mainParts[1].trim();
                         Long workshopId;
-                        
+
                         // Check if we have full parameters or just ID
                         if (!idPart.contains("|")) {
                             workshopId = Long.parseLong(idPart);
@@ -735,7 +928,7 @@ public class TelegramBotService {
                                         String startDate = workshop.getStartTime().format(DATE_FORMATTER);
                                         String startTime = workshop.getStartTime().format(TIME_FORMATTER);
                                         String endTime = workshop.getEndTime().format(TIME_FORMATTER);
-                                        
+
                                         String editFormat = String.format(
                                                 "/edit_workshop %d|%s|%s|%s|%s|%s|%d|%b",
                                                 workshop.getId(),
@@ -747,12 +940,12 @@ public class TelegramBotService {
                                                 workshop.getCapacity(),
                                                 workshop.isActive()
                                         );
-                                        
+
                                         int registeredCount = workshopService.getWorkshopParticipants(workshop).size();
                                         int waitlistCount = workshopService.getWorkshopWaitlist(workshop).size();
-                                        
-                                        sendMessage(chatId, "Текущая информация о мастер-классе:\n\n" + 
-                                                workshopService.formatWorkshopInfoSafe(workshop, registeredCount, waitlistCount) + 
+
+                                        sendMessage(chatId, "Текущая информация о мастер-классе:\n\n" +
+                                                workshopService.formatWorkshopInfoSafe(workshop, registeredCount, waitlistCount) +
                                                 "\n\nДля редактирования используйте следующий формат (скопируйте и измените нужные поля):\n" +
                                                 editFormat);
                                     },
@@ -760,7 +953,7 @@ public class TelegramBotService {
                             );
                             return;
                         }
-                        
+
                         // Parse all parameters
                         String[] params = idPart.split("\\|");
                         if (params.length < 8) {
@@ -768,7 +961,7 @@ public class TelegramBotService {
                                     "/edit_workshop <id>|<название>|<описание>|<дата (дд.мм.гггг)>|<время начала (чч:мм)>|<время окончания (чч:мм)>|<количество мест>|<активен (true/false)>");
                             return;
                         }
-                        
+
                         workshopId = Long.parseLong(params[0].trim());
                         String title = params[1].trim();
                         String description = params[2].trim();
@@ -777,60 +970,60 @@ public class TelegramBotService {
                         String endTimeStr = params[5].trim();
                         int capacity;
                         boolean active;
-                        
+
                         try {
                             capacity = Integer.parseInt(params[6].trim());
                         } catch (NumberFormatException e) {
                             sendMessage(chatId, "Некорректное количество мест. Укажите целое число.");
                             return;
                         }
-                        
+
                         if (capacity <= 0) {
                             sendMessage(chatId, "Количество мест должно быть положительным числом.");
                             return;
                         }
-                        
+
                         try {
                             active = Boolean.parseBoolean(params[7].trim());
                         } catch (Exception e) {
                             sendMessage(chatId, "Некорректное значение активности. Укажите true или false.");
                             return;
                         }
-                        
+
                         // Parse date and time
                         LocalDateTime startDateTime, endDateTime;
                         try {
                             LocalDateTime date = LocalDateTime.parse(
-                                    dateStr + " " + startTimeStr, 
+                                    dateStr + " " + startTimeStr,
                                     DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm"));
                             startDateTime = date;
-                            
+
                             LocalDateTime endDate = LocalDateTime.parse(
-                                    dateStr + " " + endTimeStr, 
+                                    dateStr + " " + endTimeStr,
                                     DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm"));
                             endDateTime = endDate;
                         } catch (Exception e) {
                             sendMessage(chatId, "Ошибка в формате даты или времени. Используйте формат дд.мм.гггг для даты и чч:мм для времени.");
                             return;
                         }
-                        
+
                         if (endDateTime.isBefore(startDateTime)) {
                             sendMessage(chatId, "Время окончания мастер-класса не может быть раньше времени начала.");
                             return;
                         }
-                        
+
                         // Update workshop
                         workshopService.updateWorkshop(workshopId, title, description, startDateTime, endDateTime, capacity, active)
-                            .ifPresentOrElse(
-                                workshop -> {
-                                    int registeredCount = workshopService.getWorkshopParticipants(workshop).size();
-                                    int waitlistCount = workshopService.getWorkshopWaitlist(workshop).size();
-                                    sendMessage(chatId, "Мастер-класс успешно обновлен!\n\n" + 
-                                            workshopService.formatWorkshopInfoSafe(workshop, registeredCount, waitlistCount));
-                                },
-                                () -> sendMessage(chatId, "Мастер-класс с ID " + workshopId + " не найден.")
-                            );
-                        
+                                .ifPresentOrElse(
+                                        workshop -> {
+                                            int registeredCount = workshopService.getWorkshopParticipants(workshop).size();
+                                            int waitlistCount = workshopService.getWorkshopWaitlist(workshop).size();
+                                            sendMessage(chatId, "Мастер-класс успешно обновлен!\n\n" +
+                                                    workshopService.formatWorkshopInfoSafe(workshop, registeredCount, waitlistCount));
+                                        },
+                                        () -> sendMessage(chatId, "Мастер-класс с ID " + workshopId + " не найден.")
+                                );
+
                     } catch (NumberFormatException e) {
                         sendMessage(chatId, "Некорректный ID мастер-класса.");
                     } catch (Exception e) {
@@ -846,7 +1039,7 @@ public class TelegramBotService {
     protected void processDeleteWorkshopCommand(Long chatId, String text) {
         userService.findUserByChatId(chatId).ifPresentOrElse(
                 user -> {
-                    if (!(userService.hasRole(user.getId(), UserRole.ORGANIZER) || 
+                    if (!(userService.hasRole(user.getId(), UserRole.ORGANIZER) ||
                             userService.hasRole(user.getId(), UserRole.ADMIN))) {
                         sendMessage(chatId, "У вас нет прав на выполнение этой команды. Требуется роль организатора или администратора.");
                         return;
@@ -918,14 +1111,14 @@ public class TelegramBotService {
                                             UserInfo info = reg.getUser().getUserInfo();
                                             sb.append(i++).append(". ")
                                                     .append(info.getName());
-                                                    
-                                                    // Добавляем username, если он существует
-                                                    if (info.getUsername() != null && !info.getUsername().isEmpty()) {
-                                                        sb.append(" (@").append(info.getUsername()).append(")");
-                                                    }
-                                                    
-                                                    sb.append(" - chatId: ").append(info.getChatId())
-                                                      .append("\n");
+
+                                            // Добавляем username, если он существует
+                                            if (info.getUsername() != null && !info.getUsername().isEmpty()) {
+                                                sb.append(" (@").append(info.getUsername()).append(")");
+                                            }
+
+                                            sb.append(" - chatId: ").append(info.getChatId())
+                                                    .append("\n");
                                         }
                                         sb.append("\n");
                                     }
@@ -937,20 +1130,20 @@ public class TelegramBotService {
                                             UserInfo info = reg.getUser().getUserInfo();
                                             sb.append(i++).append(". ")
                                                     .append(info.getName());
-                                                    
-                                                    // Добавляем username, если он существует
-                                                    if (info.getUsername() != null && !info.getUsername().isEmpty()) {
-                                                        sb.append(" (@").append(info.getUsername()).append(")");
-                                                    }
-                                                    
-                                                    sb.append(" - chatId: ").append(info.getChatId());
-                                                    
-                                                    // Добавляем позицию в листе ожидания, если она существует
-                                                    if (reg.getWaitlistPosition() != null) {
-                                                        sb.append(", позиция: ").append(reg.getWaitlistPosition());
-                                                    }
-                                                    
-                                                    sb.append("\n");
+
+                                            // Добавляем username, если он существует
+                                            if (info.getUsername() != null && !info.getUsername().isEmpty()) {
+                                                sb.append(" (@").append(info.getUsername()).append(")");
+                                            }
+
+                                            sb.append(" - chatId: ").append(info.getChatId());
+
+                                            // Добавляем позицию в листе ожидания, если она существует
+                                            if (reg.getWaitlistPosition() != null) {
+                                                sb.append(", позиция: ").append(reg.getWaitlistPosition());
+                                            }
+
+                                            sb.append("\n");
                                         }
                                     }
 
@@ -1167,17 +1360,292 @@ public class TelegramBotService {
         );
     }
 
+    /**
+     * Обрабатывает команду сканирования QR-кода
+     */
+    @Transactional
+    protected void processScanQrCommand(Long chatId, String text) {
+        userService.findUserByChatId(chatId).ifPresentOrElse(
+                user -> {
+                    if (!(userService.hasRole(user.getId(), UserRole.ORGANIZER) ||
+                            userService.hasRole(user.getId(), UserRole.ADMIN))) {
+                        sendMessage(chatId, "У вас нет прав на выполнение этой команды. Требуется роль организатора или администратора.");
+                        return;
+                    }
+
+                    // Проверяем, это начальная команда или уже содержит QR-код
+                    if (text.trim().equals("/scan_qr")) {
+                        sendMessage(chatId, "Пожалуйста, отсканируйте QR-код участника и отправьте его содержимое.\n\n" +
+                                "Формат QR-кода: ID:USER_ID:NAME:CHAT_ID\n\n" +
+                                "После отправки содержимого QR-кода, вы получите информацию о пользователе и сможете отметить его посещение.");
+                        return;
+                    }
+
+                    // Пробуем извлечь содержимое QR-кода
+                    String qrContent = text.substring("/scan_qr".length()).trim();
+                    workshopService.findUserByQrContent(qrContent).ifPresentOrElse(
+                            scannedUser -> {
+                                UserInfo userInfo = scannedUser.getUserInfo();
+                                if (userInfo != null) {
+                                    // Получаем список мастер-классов, на которые записан пользователь
+                                    List<WorkshopRegistration> registrations = workshopService.getUserRegistrations(scannedUser)
+                                            .stream()
+                                            .filter(reg -> !reg.isWaitlist())
+                                            .toList();
+
+                                    if (registrations.isEmpty()) {
+                                        sendMessage(chatId, String.format(
+                                                "✅ Пользователь идентифицирован:\n" +
+                                                "👤 %s\n" +
+                                                "🆔 ID чата: %d\n\n" +
+                                                "❌ Пользователь не записан ни на один мастер-класс.",
+                                                userInfo.getName(),
+                                                userInfo.getChatId()
+                                        ));
+                                        return;
+                                    }
+
+                                    StringBuilder sb = new StringBuilder();
+                                    sb.append("✅ Пользователь идентифицирован:\n")
+                                            .append("👤 ").append(userInfo.getName()).append("\n");
+                                    
+                                    if (userInfo.getUsername() != null && !userInfo.getUsername().isEmpty()) {
+                                        sb.append("👤 @").append(userInfo.getUsername()).append("\n");
+                                    }
+                                    
+                                    sb.append("🆔 ID чата: ").append(userInfo.getChatId()).append("\n\n")
+                                            .append("Мастер-классы, на которые записан пользователь:\n\n");
+
+                                    for (WorkshopRegistration reg : registrations) {
+                                        Workshop workshop = reg.getWorkshop();
+                                        String attendanceStatus = reg.isAttended() ? "✅ Присутствовал" : "❌ Не отмечен";
+                                        sb.append(String.format(
+                                                "%d. %s\n%s (%s)\nСтатус: %s\n\n",
+                                                workshop.getId(),
+                                                workshop.getTitle(),
+                                                workshop.getStartTime().format(DATE_TIME_FORMATTER),
+                                                workshop.getEndTime().format(DATE_TIME_FORMATTER),
+                                                attendanceStatus
+                                        ));
+                                    }
+
+                                    sb.append("Для отметки посещения используйте команду:\n")
+                                            .append("/mark_attendance <workshop_id>|<статус>\n\n")
+                                            .append("Где статус: true - присутствовал, false - не присутствовал\n\n")
+                                            .append("Например:\n")
+                                            .append("/mark_attendance ").append(registrations.get(0).getWorkshop().getId()).append("|true");
+
+                                    sendMessage(chatId, sb.toString());
+                                } else {
+                                    sendMessage(chatId, "Пользователь найден, но информация о нем отсутствует.");
+                                }
+                            },
+                            () -> sendMessage(chatId, "QR-код не распознан или пользователь не найден. Проверьте формат и попробуйте еще раз.")
+                    );
+                },
+                () -> sendMessage(chatId, "Вы не зарегистрированы. Используйте /start для регистрации.")
+        );
+    }
+
+    /**
+     * Обрабатывает команду отметки посещения
+     */
+    @Transactional
+    protected void processMarkAttendanceCommand(Long chatId, String text) {
+        userService.findUserByChatId(chatId).ifPresentOrElse(
+                organizer -> {
+                    if (!(userService.hasRole(organizer.getId(), UserRole.ORGANIZER) ||
+                            userService.hasRole(organizer.getId(), UserRole.ADMIN))) {
+                        sendMessage(chatId, "У вас нет прав на выполнение этой команды. Требуется роль организатора или администратора.");
+                        return;
+                    }
+
+                    // Проверяем, это начальная команда или уже содержит параметры
+                    if (text.trim().equals("/mark_attendance")) {
+                        sendMessage(chatId, "Для отметки посещения используйте формат:\n" +
+                                "/mark_attendance <workshop_id>|<user_id>|<status>\n\n" +
+                                "Где:\n" +
+                                "<workshop_id> - ID мастер-класса\n" +
+                                "<user_id> - ID пользователя (можно получить после сканирования QR-кода)\n" +
+                                "<status> - статус посещения (true - присутствовал, false - не присутствовал)");
+                        return;
+                    }
+
+                    try {
+                        String paramString = text.substring("/mark_attendance".length()).trim();
+                        String[] params = paramString.split("\\|");
+
+                        // Проверяем, хватает ли параметров
+                        if (params.length < 3) {
+                            // Попытка обработать краткий формат с двумя параметрами (workshop_id|status)
+                            if (params.length == 2) {
+                                try {
+                                    Long workshopId = Long.parseLong(params[0].trim());
+                                    boolean status = Boolean.parseBoolean(params[1].trim());
+                                    
+                                    // Здесь предполагаем, что это продолжение команды scan_qr
+                                    // и пользователь уже выбран. Получаем последнего сканированного пользователя
+                                    // из временного хранилища или из контекста сессии.
+                                    
+                                    // TODO: Для полной реализации требуется сохранение контекста сессии пользователя
+                                    // Пока делаем простую проверку по параметрам
+                                    sendMessage(chatId, "Пожалуйста, укажите ID пользователя: /mark_attendance " + 
+                                            workshopId + "|<user_id>|" + status);
+                                    return;
+                                } catch (Exception e) {
+                                    sendMessage(chatId, "Некорректный формат параметров.");
+                                    return;
+                                }
+                            } else {
+                                sendMessage(chatId, "Недостаточно параметров. Используйте формат:\n" +
+                                        "/mark_attendance <workshop_id>|<user_id>|<status>");
+                                return;
+                            }
+                        }
+
+                        // Разбираем параметры
+                        Long workshopId = Long.parseLong(params[0].trim());
+                        Long userId = Long.parseLong(params[1].trim());
+                        boolean attended = Boolean.parseBoolean(params[2].trim());
+
+                        // Находим мастер-класс
+                        workshopService.getWorkshopById(workshopId).ifPresentOrElse(
+                                workshop -> {
+                                    // Находим пользователя
+                                    userService.findUserById(userId).ifPresentOrElse(
+                                            participant -> {
+                                                // Отмечаем посещение
+                                                boolean success = workshopService.markAttendance(workshop, participant, attended, organizer.getId());
+                                                if (success) {
+                                                    String status = attended ? "отмечен как присутствующий" : "отмечен как отсутствующий";
+                                                    sendMessage(chatId, String.format("Участник %s %s на мастер-классе \"%s\".",
+                                                            participant.getUserInfo().getName(),
+                                                            status,
+                                                            workshop.getTitle()));
+                                                } else {
+                                                    sendMessage(chatId, String.format("Не удалось отметить посещение. Возможно, %s не зарегистрирован на мастер-класс \"%s\" или находится в листе ожидания.",
+                                                            participant.getUserInfo().getName(),
+                                                            workshop.getTitle()));
+                                                }
+                                            },
+                                            () -> sendMessage(chatId, "Пользователь с ID " + userId + " не найден.")
+                                    );
+                                },
+                                () -> sendMessage(chatId, "Мастер-класс с ID " + workshopId + " не найден.")
+                        );
+                    } catch (NumberFormatException e) {
+                        sendMessage(chatId, "Некорректный формат ID. Проверьте параметры.");
+                    } catch (Exception e) {
+                        logger.error("Error marking attendance", e);
+                        sendMessage(chatId, "Произошла ошибка при отметке посещения. Проверьте формат ввода.");
+                    }
+                },
+                () -> sendMessage(chatId, "Вы не зарегистрированы. Используйте /start для регистрации.")
+        );
+    }
+    
+    /**
+     * Обрабатывает команду просмотра отчета о посещении мастер-класса
+     */
+    @Transactional
+    protected void processWorkshopAttendanceCommand(Long chatId, String text) {
+        userService.findUserByChatId(chatId).ifPresentOrElse(
+                user -> {
+                    if (!(userService.hasRole(user.getId(), UserRole.ORGANIZER) ||
+                            userService.hasRole(user.getId(), UserRole.ADMIN))) {
+                        sendMessage(chatId, "У вас нет прав на выполнение этой команды. Требуется роль организатора или администратора.");
+                        return;
+                    }
+
+                    String[] parts = text.split(" ", 2);
+                    if (parts.length < 2 || parts[1].trim().isEmpty()) {
+                        sendMessage(chatId, "Пожалуйста, укажите ID мастер-класса: /workshop_attendance <id>");
+                        return;
+                    }
+
+                    try {
+                        Long workshopId = Long.parseLong(parts[1].trim());
+                        workshopService.getWorkshopById(workshopId).ifPresentOrElse(
+                                workshop -> {
+                                    List<WorkshopRegistration> registrations = workshopService.getWorkshopAttendance(workshop);
+                                    if (registrations.isEmpty()) {
+                                        sendMessage(chatId, "На мастер-класс \"" + workshop.getTitle() + "\" не записан ни один участник.");
+                                        return;
+                                    }
+
+                                    int totalRegistered = registrations.size();
+                                    int totalAttended = 0;
+                                    
+                                    StringBuilder sb = new StringBuilder();
+                                    sb.append("📊 Отчет о посещении мастер-класса\n\n")
+                                            .append("📌 ").append(workshop.getTitle()).append("\n")
+                                            .append("🕒 ").append(workshop.getStartTime().format(DATE_TIME_FORMATTER)).append("\n")
+                                            .append("👨‍👩‍👧‍👦 Участники (").append(totalRegistered).append("):\n\n");
+
+                                    for (int i = 0; i < registrations.size(); i++) {
+                                        WorkshopRegistration reg = registrations.get(i);
+                                        UserInfo userInfo = reg.getUser().getUserInfo();
+                                        
+                                        if (reg.isAttended()) {
+                                            totalAttended++;
+                                        }
+                                        
+                                        String attendanceStatus = reg.isAttended() ? "✅ Присутствовал" : "❌ Не отмечен";
+                                        String attendanceTime = reg.getAttendanceTime() != null ? 
+                                                reg.getAttendanceTime().format(DATE_TIME_FORMATTER) : "-";
+                                        
+                                        sb.append(String.format("%d. %s", (i + 1), userInfo.getName()));
+                                        
+                                        if (userInfo.getUsername() != null && !userInfo.getUsername().isEmpty()) {
+                                            sb.append(String.format(" (@%s)", userInfo.getUsername()));
+                                        }
+                                        
+                                        sb.append(String.format(
+                                                "\nСтатус: %s\nОтметил: %s\nВремя: %s\n\n",
+                                                attendanceStatus,
+                                                reg.getMarkedByUserId() != null ? 
+                                                        userService.findUserById(reg.getMarkedByUserId())
+                                                                .map(u -> u.getUserInfo().getName())
+                                                                .orElse("Неизвестно") : "-",
+                                                attendanceTime
+                                        ));
+                                    }
+                                    
+                                    sb.append(String.format(
+                                            "📌 Итого: %d/%d участников присутствовало (%.1f%%)",
+                                            totalAttended,
+                                            totalRegistered,
+                                            totalRegistered > 0 ? (100.0 * totalAttended / totalRegistered) : 0.0
+                                    ));
+
+                                    sendMessage(chatId, sb.toString());
+                                },
+                                () -> sendMessage(chatId, "Мастер-класс с ID " + workshopId + " не найден.")
+                        );
+                    } catch (NumberFormatException e) {
+                        sendMessage(chatId, "Пожалуйста, укажите корректный ID мастер-класса: /workshop_attendance <id>");
+                    }
+                },
+                () -> sendMessage(chatId, "Вы не зарегистрированы. Используйте /start для регистрации.")
+        );
+    }
+
     private void sendMessage(Long chatId, String text) {
         telegramBot.execute(new SendMessage(chatId, text));
     }
 
     /**
      * Генерирует содержимое QR-кода для пользователя.
-     * Формат: ID:USER_ID:NAME:CHAT_ID
+     * Формат: t.me/BOT_USERNAME?start=attendance_USER_ID
+     * Это создаст deep link, который при сканировании откроет чат с ботом
+     * и автоматически отправит команду /start с параметром
      */
     private String generateQrCodeContent(ru.unithack.bot.domain.model.User user) {
-        UserInfo info = user.getUserInfo();
-        return String.format("ID:%d:%s:%d", user.getId(), info.getName(), info.getChatId());
+        // Сохраняем оригинальные данные пользователя в закодированном виде
+        String encodedData = "attendance_" + user.getId();
+        
+        // Формируем deep link для Telegram
+        return "https://t.me/" + botUsername + "?start=" + encodedData;
     }
 
     private void sendPhoto(Long chatId, byte[] photoData, String caption) {
@@ -1185,4 +1653,4 @@ public class TelegramBotService {
                 .caption(caption);
         telegramBot.execute(sendPhoto);
     }
-} 
+}
