@@ -26,6 +26,15 @@ public class WorkshopRegistration {
 
     @Column(nullable = false)
     private boolean waitlist = false;
+    
+    @Column(nullable = false)
+    private boolean pendingConfirmation = false;
+    
+    @Column
+    private LocalDateTime confirmationDeadline;
+    
+    @Column
+    private Integer waitlistPosition;
 
     public WorkshopRegistration() {
         this.registrationTime = LocalDateTime.now();
@@ -70,6 +79,30 @@ public class WorkshopRegistration {
     public void setWaitlist(boolean waitlist) {
         this.waitlist = waitlist;
     }
+    
+    public boolean isPendingConfirmation() {
+        return pendingConfirmation;
+    }
+    
+    public void setPendingConfirmation(boolean pendingConfirmation) {
+        this.pendingConfirmation = pendingConfirmation;
+    }
+    
+    public LocalDateTime getConfirmationDeadline() {
+        return confirmationDeadline;
+    }
+    
+    public void setConfirmationDeadline(LocalDateTime confirmationDeadline) {
+        this.confirmationDeadline = confirmationDeadline;
+    }
+    
+    public Integer getWaitlistPosition() {
+        return waitlistPosition;
+    }
+    
+    public void setWaitlistPosition(Integer waitlistPosition) {
+        this.waitlistPosition = waitlistPosition;
+    }
 
     @Override
     public int hashCode() {
@@ -92,6 +125,9 @@ public class WorkshopRegistration {
                 ", user=" + (user != null ? user.getId() : null) +
                 ", registrationTime=" + registrationTime +
                 ", waitlist=" + waitlist +
+                ", pendingConfirmation=" + pendingConfirmation +
+                ", confirmationDeadline=" + confirmationDeadline +
+                ", waitlistPosition=" + waitlistPosition +
                 '}';
     }
 } 

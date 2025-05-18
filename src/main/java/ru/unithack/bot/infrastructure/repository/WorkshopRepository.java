@@ -27,4 +27,10 @@ public interface WorkshopRepository extends JpaRepository<Workshop, Long> {
     
     @Query("SELECT w FROM Workshop w LEFT JOIN FETCH w.registrations WHERE w.id = :id")
     Optional<Workshop> findByIdWithRegistrations(Long id);
+    
+    /**
+     * Находит активные мастер-классы, которые начнутся в течение указанного диапазона времени
+     */
+    @Query("SELECT w FROM Workshop w WHERE w.active = true AND w.startTime > :start AND w.startTime < :end ORDER BY w.startTime ASC")
+    List<Workshop> findByActiveTrueAndStartTimeBetween(LocalDateTime start, LocalDateTime end);
 } 

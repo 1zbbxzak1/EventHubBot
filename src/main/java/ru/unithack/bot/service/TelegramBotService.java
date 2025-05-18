@@ -127,6 +127,8 @@ public class TelegramBotService {
             processAddParticipantCommand(chatId, text);
         } else if (text.startsWith("/remove_participant")) {
             processRemoveParticipantCommand(chatId, text);
+        } else if (text.startsWith("/confirm_workshop")) {
+            processConfirmWorkshopCommand(chatId, text);
         } else {
             userService.findUserByChatId(chatId).ifPresentOrElse(
                     user -> {
@@ -145,6 +147,7 @@ public class TelegramBotService {
                         commandsBuilder.append("/register_workshop <id> - Записаться на мастер-класс\n");
                         commandsBuilder.append("/cancel_workshop <id> - Отменить запись на мастер-класс\n");
                         commandsBuilder.append("/my_workshops - Мои записи на мастер-классы\n");
+                        commandsBuilder.append("/confirm_workshop <id> - Подтвердить участие после получения места из листа ожидания\n");
 
                         // Commands for ORGANIZER and ADMIN
                         if (userService.hasRole(user.getId(), UserRole.ORGANIZER) ||
@@ -415,6 +418,7 @@ public class TelegramBotService {
                     commandsBuilder.append("/register_workshop <id> - Записаться на мастер-класс\n");
                     commandsBuilder.append("/cancel_workshop <id> - Отменить запись на мастер-класс\n");
                     commandsBuilder.append("/my_workshops - Мои записи на мастер-классы\n");
+                    commandsBuilder.append("/confirm_workshop <id> - Подтвердить участие после получения места из листа ожидания\n");
 
                     // Commands for ORGANIZER and ADMIN
                     if (userService.hasRole(user.getId(), UserRole.ORGANIZER) ||
@@ -436,6 +440,14 @@ public class TelegramBotService {
                         commandsBuilder.append("/remove_organizer <chatId> - Удалить организатора\n");
                         commandsBuilder.append("/list_users - Список пользователей\n");
                     }
+                    
+                    // System info about waitlists
+                    commandsBuilder.append("\nИнформация о листе ожидания:\n");
+                    commandsBuilder.append("✓ Если места на мастер-класс закончились, вы можете записаться в лист ожидания\n");
+                    commandsBuilder.append("✓ При этом вы получите номер в очереди\n");
+                    commandsBuilder.append("✓ При освобождении места первый человек в очереди получит уведомление\n");
+                    commandsBuilder.append("✓ У вас будет 15 минут на подтверждение участия через команду /confirm_workshop\n");
+                    commandsBuilder.append("✓ Если вы не подтвердите участие вовремя, место будет предложено следующему\n");
 
                     sendMessage(chatId, commandsBuilder.toString());
                 },
@@ -584,10 +596,19 @@ public class TelegramBotService {
                         Workshop workshop = (Workshop) data[0];
                         int registeredCount = (int) data[1];
                         boolean isWaitlist = (boolean) data[3];
+                        Integer waitlistPosition = (Integer) data[4];
                         
-                        sb.append(workshopService.formatWorkshopListItemSafe(workshop, registeredCount))
-                                .append(isWaitlist ? " (в листе ожидания)" : "")
-                                .append("\n");
+                        sb.append(workshopService.formatWorkshopListItemSafe(workshop, registeredCount));
+                        
+                        if (isWaitlist) {
+                            if (waitlistPosition != null) {
+                                sb.append(String.format(" (в листе ожидания, позиция: %d)", waitlistPosition));
+                            } else {
+                                sb.append(" (в листе ожидания)");
+                            }
+                        }
+                        
+                        sb.append("\n");
                     }
 
                     sb.append("\nДля отмены записи используйте команду /cancel_workshop <id>");
@@ -896,9 +917,15 @@ public class TelegramBotService {
                                         for (WorkshopRegistration reg : participants) {
                                             UserInfo info = reg.getUser().getUserInfo();
                                             sb.append(i++).append(". ")
-                                                    .append(info.getName())
-                                                    .append(" (chatId: ").append(info.getChatId()).append(")")
-                                                    .append("\n");
+                                                    .append(info.getName());
+                                                    
+                                                    // Добавляем username, если он существует
+                                                    if (info.getUsername() != null && !info.getUsername().isEmpty()) {
+                                                        sb.append(" (@").append(info.getUsername()).append(")");
+                                                    }
+                                                    
+                                                    sb.append(" - chatId: ").append(info.getChatId())
+                                                      .append("\n");
                                         }
                                         sb.append("\n");
                                     }
@@ -909,9 +936,21 @@ public class TelegramBotService {
                                         for (WorkshopRegistration reg : waitlist) {
                                             UserInfo info = reg.getUser().getUserInfo();
                                             sb.append(i++).append(". ")
-                                                    .append(info.getName())
-                                                    .append(" (chatId: ").append(info.getChatId()).append(")")
-                                                    .append("\n");
+                                                    .append(info.getName());
+                                                    
+                                                    // Добавляем username, если он существует
+                                                    if (info.getUsername() != null && !info.getUsername().isEmpty()) {
+                                                        sb.append(" (@").append(info.getUsername()).append(")");
+                                                    }
+                                                    
+                                                    sb.append(" - chatId: ").append(info.getChatId());
+                                                    
+                                                    // Добавляем позицию в листе ожидания, если она существует
+                                                    if (reg.getWaitlistPosition() != null) {
+                                                        sb.append(", позиция: ").append(reg.getWaitlistPosition());
+                                                    }
+                                                    
+                                                    sb.append("\n");
                                         }
                                     }
 
@@ -1084,6 +1123,44 @@ public class TelegramBotService {
                     } catch (Exception e) {
                         logger.error("Error removing participant", e);
                         sendMessage(chatId, "Произошла ошибка при удалении участника. Проверьте формат ввода.");
+                    }
+                },
+                () -> sendMessage(chatId, "Вы не зарегистрированы. Используйте /start для регистрации.")
+        );
+    }
+
+    @Transactional
+    protected void processConfirmWorkshopCommand(Long chatId, String text) {
+        userService.findUserByChatId(chatId).ifPresentOrElse(
+                user -> {
+                    String[] parts = text.split(" ", 2);
+                    if (parts.length < 2 || parts[1].trim().isEmpty()) {
+                        sendMessage(chatId, "Для подтверждения участия используйте формат:\n" +
+                                "/confirm_workshop <id>");
+                        return;
+                    }
+
+                    try {
+                        Long workshopId = Long.parseLong(parts[1].trim());
+                        workshopService.getWorkshopById(workshopId).ifPresentOrElse(
+                                workshop -> {
+                                    if (!workshop.isActive()) {
+                                        sendMessage(chatId, "Мастер-класс неактивен или отменен.");
+                                        return;
+                                    }
+
+                                    boolean confirmed = workshopService.confirmWorkshopRegistration(workshop, user);
+                                    if (confirmed) {
+                                        sendMessage(chatId, "Вы успешно подтвердили участие в мастер-классе \"" +
+                                                workshop.getTitle() + "\".");
+                                    } else {
+                                        sendMessage(chatId, "Не удалось подтвердить участие. Возможно, вы не находитесь в листе ожидания или срок подтверждения истек.");
+                                    }
+                                },
+                                () -> sendMessage(chatId, "Мастер-класс с ID " + workshopId + " не найден.")
+                        );
+                    } catch (NumberFormatException e) {
+                        sendMessage(chatId, "Пожалуйста, укажите корректный ID мастер-класса: /confirm_workshop <id>");
                     }
                 },
                 () -> sendMessage(chatId, "Вы не зарегистрированы. Используйте /start для регистрации.")

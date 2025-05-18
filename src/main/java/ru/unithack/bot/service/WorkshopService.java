@@ -3,6 +3,7 @@ package ru.unithack.bot.service;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import ru.unithack.bot.domain.model.User;
@@ -22,15 +23,19 @@ public class WorkshopService {
 
     private static final Logger logger = LoggerFactory.getLogger(WorkshopService.class);
     private static final DateTimeFormatter DATE_TIME_FORMATTER = DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm");
+    private static final int CONFIRMATION_MINUTES = 15;
 
     private final WorkshopRepository workshopRepository;
     private final WorkshopRegistrationRepository registrationRepository;
+    private final NotificationService notificationService;
 
     @Autowired
     public WorkshopService(WorkshopRepository workshopRepository,
-                           WorkshopRegistrationRepository registrationRepository) {
+                           WorkshopRegistrationRepository registrationRepository,
+                           NotificationService notificationService) {
         this.workshopRepository = workshopRepository;
         this.registrationRepository = registrationRepository;
+        this.notificationService = notificationService;
     }
 
     @Transactional
@@ -52,13 +57,45 @@ public class WorkshopService {
                                              LocalDateTime startTime, LocalDateTime endTime,
                                              int capacity, boolean active) {
         return workshopRepository.findById(id).map(workshop -> {
+            logger.info("Updating workshop with ID {}: {}", id, workshop.getTitle());
+            
+            // Save old values for comparison
+            boolean wasActive = workshop.isActive();
+            
+            // Update workshop properties
             workshop.setTitle(title);
             workshop.setDescription(description);
             workshop.setStartTime(startTime);
             workshop.setEndTime(endTime);
             workshop.setCapacity(capacity);
             workshop.setActive(active);
-            return workshopRepository.save(workshop);
+            
+            Workshop updatedWorkshop = workshopRepository.save(workshop);
+            logger.info("Workshop saved with ID {}: {}", updatedWorkshop.getId(), updatedWorkshop.getTitle());
+            
+            // Get all participants (confirmed + waitlist) and notify them about the change
+            List<WorkshopRegistration> confirmedParticipants = registrationRepository.findByWorkshopAndWaitlistFalseOrderByRegistrationTimeAsc(workshop);
+            List<WorkshopRegistration> waitlistParticipants = registrationRepository.findByWorkshopAndWaitlistTrueOrderByRegistrationTimeAsc(workshop);
+            
+            List<WorkshopRegistration> allParticipants = new ArrayList<>();
+            allParticipants.addAll(confirmedParticipants);
+            allParticipants.addAll(waitlistParticipants);
+            
+            int participantCount = confirmedParticipants.size();
+            int waitlistCount = waitlistParticipants.size();
+            
+            logger.info("Found {} participants and {} waitlisted users for workshop {}", 
+                participantCount, waitlistCount, workshop.getId());
+            
+            if (!allParticipants.isEmpty()) {
+                logger.info("Sending update notifications to {} users for workshop {}", 
+                    allParticipants.size(), workshop.getId());
+                notificationService.sendWorkshopUpdatedNotification(updatedWorkshop, allParticipants);
+            } else {
+                logger.info("No participants to notify for workshop {}", workshop.getId());
+            }
+            
+            return updatedWorkshop;
         });
     }
 
@@ -80,12 +117,50 @@ public class WorkshopService {
     @Transactional
     public boolean deleteWorkshop(Long id) {
         if (workshopRepository.existsById(id)) {
-            workshopRepository.deleteById(id);
-            return true;
+            logger.info("Deleting workshop with ID {}", id);
+            
+            // First get the workshop with all participants
+            Optional<Workshop> workshopOpt = workshopRepository.findByIdWithRegistrations(id);
+            if (workshopOpt.isPresent()) {
+                Workshop workshop = workshopOpt.get();
+                logger.info("Found workshop for deletion: {}", workshop.getTitle());
+                
+                // Get all participants (confirmed + waitlist) for notification
+                List<WorkshopRegistration> confirmedParticipants = registrationRepository.findByWorkshopAndWaitlistFalseOrderByRegistrationTimeAsc(workshop);
+                List<WorkshopRegistration> waitlistParticipants = registrationRepository.findByWorkshopAndWaitlistTrueOrderByRegistrationTimeAsc(workshop);
+                
+                List<WorkshopRegistration> allParticipants = new ArrayList<>();
+                allParticipants.addAll(confirmedParticipants);
+                allParticipants.addAll(waitlistParticipants);
+                
+                int participantCount = confirmedParticipants.size();
+                int waitlistCount = waitlistParticipants.size();
+                
+                logger.info("Found {} participants and {} waitlisted users for workshop {}", 
+                    participantCount, waitlistCount, workshop.getId());
+                
+                // Send notifications before deleting
+                if (!allParticipants.isEmpty()) {
+                    logger.info("Sending deletion notifications to {} users for workshop {}", 
+                        allParticipants.size(), workshop.getId());
+                    notificationService.sendWorkshopDeletedNotification(workshop, allParticipants);
+                } else {
+                    logger.info("No participants to notify for workshop {}", workshop.getId());
+                }
+                
+                // Delete the workshop
+                workshopRepository.deleteById(id);
+                logger.info("Workshop with ID {} successfully deleted", id);
+                return true;
+            }
         }
+        logger.info("Workshop with ID {} not found for deletion", id);
         return false;
     }
 
+    /**
+     * Регистрирует участника на мастер-класс или добавляет в лист ожидания, если мест нет
+     */
     @Transactional
     public Optional<WorkshopRegistration> registerParticipant(Workshop workshop, User user) {
         if (registrationRepository.findByWorkshopAndUser(workshop, user).isPresent()) {
@@ -101,15 +176,34 @@ public class WorkshopService {
         // Check if there's still capacity
         int registeredCount = registrationRepository.countRegisteredParticipants(workshop);
         if (registeredCount >= workshop.getCapacity()) {
+            // Add to waitlist
             registration.setWaitlist(true);
-            logger.info("Added user {} to waitlist for workshop {}", user.getId(), workshop.getId());
+            
+            // Set waitlist position
+            Optional<Integer> maxPositionOpt = registrationRepository.findMaxWaitlistPosition(workshop);
+            int position = maxPositionOpt.orElse(0) + 1;
+            registration.setWaitlistPosition(position);
+            
+            WorkshopRegistration savedRegistration = registrationRepository.save(registration);
+            
+            // Send waitlist notification with position
+            notificationService.sendWaitlistNotification(savedRegistration);
+            
+            logger.info("Added user {} to waitlist for workshop {} at position {}", 
+                user.getId(), workshop.getId(), position);
+            
+            return Optional.of(savedRegistration);
         } else {
+            // Regular registration
+            registration = registrationRepository.save(registration);
             logger.info("Registered user {} for workshop {}", user.getId(), workshop.getId());
+            return Optional.of(registration);
         }
-
-        return Optional.of(registrationRepository.save(registration));
     }
 
+    /**
+     * Отменяет регистрацию пользователя на мастер-класс
+     */
     @Transactional
     public boolean cancelRegistration(Workshop workshop, User user) {
         Optional<WorkshopRegistration> registrationOpt = registrationRepository.findByWorkshopAndUser(workshop, user);
@@ -118,30 +212,183 @@ public class WorkshopService {
         }
 
         WorkshopRegistration registration = registrationOpt.get();
+        boolean wasWaitlisted = registration.isWaitlist();
+        int waitlistPosition = registration.getWaitlistPosition() != null ? registration.getWaitlistPosition() : 0;
+        
         registrationRepository.delete(registration);
-
-        // If the cancelled registration was not on the waitlist, promote someone from the waitlist
-        if (!registration.isWaitlist()) {
-            promoteFromWaitlist(workshop);
+        
+        // If it was a waitlist registration, decrement the position of all following waitlist entries
+        if (wasWaitlisted && waitlistPosition > 0) {
+            registrationRepository.decrementWaitlistPositionsAfter(workshop, waitlistPosition);
+        } 
+        // If it was a regular registration, offer the spot to all users in the waitlist
+        else if (!wasWaitlisted) {
+            notifyAllWaitlistUsers(workshop);
         }
 
         return true;
     }
-
+    
+    /**
+     * Уведомляет всех пользователей в листе ожидания о появлении свободного места
+     */
     @Transactional
-    public boolean promoteFromWaitlist(Workshop workshop) {
+    public void notifyAllWaitlistUsers(Workshop workshop) {
         List<WorkshopRegistration> waitlist = registrationRepository.findByWorkshopAndWaitlistTrueOrderByRegistrationTimeAsc(workshop);
         if (waitlist.isEmpty()) {
-            return false;
+            return;
         }
 
-        WorkshopRegistration nextInLine = waitlist.get(0);
-        nextInLine.setWaitlist(false);
-        registrationRepository.save(nextInLine);
-
-        logger.info("Promoted user {} from waitlist for workshop {}",
-                nextInLine.getUser().getId(), workshop.getId());
+        // Установить флаг открытой регистрации для всех в листе ожидания
+        LocalDateTime deadline = LocalDateTime.now().plusMinutes(CONFIRMATION_MINUTES);
+        
+        for (WorkshopRegistration waitlistReg : waitlist) {
+            waitlistReg.setPendingConfirmation(true);
+            waitlistReg.setConfirmationDeadline(deadline);
+            registrationRepository.save(waitlistReg);
+            
+            // Отправить уведомление каждому пользователю
+            notificationService.sendConfirmationRequestToAll(waitlistReg, waitlist.size());
+            
+            logger.info("Sent confirmation request to user {} for workshop {}, deadline: {}",
+                    waitlistReg.getUser().getId(), workshop.getId(), deadline);
+        }
+    }
+    
+    /**
+     * Подтверждает участие пользователя в мастер-классе после предложения места из листа ожидания
+     */
+    @Transactional
+    public boolean confirmWorkshopRegistration(Workshop workshop, User user) {
+        Optional<WorkshopRegistration> registrationOpt = registrationRepository.findByWorkshopAndUser(workshop, user);
+        if (registrationOpt.isEmpty()) {
+            return false;
+        }
+        
+        WorkshopRegistration registration = registrationOpt.get();
+        
+        // Check if registration is pending confirmation and deadline hasn't passed
+        if (!registration.isPendingConfirmation() || 
+                registration.getConfirmationDeadline() == null ||
+                registration.getConfirmationDeadline().isBefore(LocalDateTime.now())) {
+            return false;
+        }
+        
+        // Проверка на количество участников, чтобы убедиться, что место всё ещё доступно
+        int registeredCount = registrationRepository.countRegisteredParticipants(workshop);
+        if (registeredCount >= workshop.getCapacity()) {
+            // Место уже занято другим участником из листа ожидания
+            notificationService.sendSpotTakenNotification(registration);
+            
+            // Сбросить флаг подтверждения
+            registration.setPendingConfirmation(false);
+            registration.setConfirmationDeadline(null);
+            registrationRepository.save(registration);
+            
+            return false;
+        }
+        
+        // Move from waitlist to confirmed participants
+        int position = registration.getWaitlistPosition() != null ? registration.getWaitlistPosition() : 0;
+        
+        registration.setWaitlist(false);
+        registration.setPendingConfirmation(false);
+        registration.setConfirmationDeadline(null);
+        registration.setWaitlistPosition(null);
+        
+        registrationRepository.save(registration);
+        
+        // Update waitlist positions for others
+        if (position > 0) {
+            registrationRepository.decrementWaitlistPositionsAfter(workshop, position);
+        }
+        
+        // Send confirmation notification
+        notificationService.sendRegistrationConfirmedNotification(registration);
+        
+        // Закрыть возможность подтверждения для остальных
+        closeConfirmationForOthers(workshop, user);
+        
+        logger.info("User {} confirmed registration for workshop {}", user.getId(), workshop.getId());
         return true;
+    }
+    
+    /**
+     * Закрывает возможность подтверждения для всех остальных пользователей в листе ожидания
+     */
+    @Transactional
+    private void closeConfirmationForOthers(Workshop workshop, User confirmedUser) {
+        List<WorkshopRegistration> waitlistUsers = registrationRepository.findByWorkshopAndWaitlistTrueOrderByRegistrationTimeAsc(workshop);
+        
+        for (WorkshopRegistration waitlistReg : waitlistUsers) {
+            if (!waitlistReg.getUser().getId().equals(confirmedUser.getId()) && waitlistReg.isPendingConfirmation()) {
+                waitlistReg.setPendingConfirmation(false);
+                waitlistReg.setConfirmationDeadline(null);
+                registrationRepository.save(waitlistReg);
+                
+                // Уведомить пользователя, что место уже занято
+                notificationService.sendSpotTakenNotification(waitlistReg);
+                
+                logger.info("Closed confirmation for user {} as spot was taken by user {}", 
+                        waitlistReg.getUser().getId(), confirmedUser.getId());
+            }
+        }
+    }
+    
+    /**
+     * Проверяет истекшие подтверждения каждую минуту и удаляет пользователей из листа ожидания
+     */
+    @Scheduled(fixedRate = 60000) // Каждую минуту (60000 мс)
+    @Transactional
+    public void processExpiredConfirmations() {
+        logger.debug("Checking for expired confirmations");
+        LocalDateTime now = LocalDateTime.now();
+        
+        // Get all active workshops
+        List<Workshop> activeWorkshops = workshopRepository.findByActiveTrue();
+        
+        for (Workshop workshop : activeWorkshops) {
+            // Find expired confirmations for this workshop
+            List<WorkshopRegistration> expiredConfirmations = 
+                registrationRepository.findExpiredConfirmations(workshop, now);
+            
+            for (WorkshopRegistration expiredReg : expiredConfirmations) {
+                // Send notification about expired confirmation
+                notificationService.sendConfirmationExpiredNotification(expiredReg);
+                
+                // Если пользователь не подтвердил участие, удаляем его из листа ожидания
+                if (expiredReg.isWaitlist()) {
+                    int position = expiredReg.getWaitlistPosition() != null ? expiredReg.getWaitlistPosition() : 0;
+                    
+                    // Удаляем пользователя
+                    registrationRepository.delete(expiredReg);
+                    
+                    // Обновляем позиции в листе ожидания
+                    if (position > 0) {
+                        registrationRepository.decrementWaitlistPositionsAfter(workshop, position);
+                    }
+                    
+                    logger.info("Removed user {} from waitlist due to expired confirmation", 
+                        expiredReg.getUser().getId());
+                } else {
+                    // Сбрасываем флаг подтверждения
+                    expiredReg.setPendingConfirmation(false);
+                    expiredReg.setConfirmationDeadline(null);
+                    registrationRepository.save(expiredReg);
+                    
+                    logger.info("Reset confirmation status for user {} for workshop {}", 
+                        expiredReg.getUser().getId(), workshop.getId());
+                }
+            }
+            
+            // Проверяем, есть ли свободные места для следующего уведомления
+            int registeredCount = registrationRepository.countRegisteredParticipants(workshop);
+            if (registeredCount < workshop.getCapacity() && !expiredConfirmations.isEmpty()) {
+                // Если есть свободные места и истекли какие-то подтверждения, 
+                // уведомляем всех оставшихся в листе ожидания
+                notifyAllWaitlistUsers(workshop);
+            }
+        }
     }
 
     @Transactional
@@ -152,6 +399,21 @@ public class WorkshopService {
             WorkshopRegistration registration = existingRegistration.get();
             // Update waitlist status if different
             if (registration.isWaitlist() != addToWaitlist) {
+                if (addToWaitlist) {
+                    // Add to waitlist
+                    Optional<Integer> maxPositionOpt = registrationRepository.findMaxWaitlistPosition(workshop);
+                    int position = maxPositionOpt.orElse(0) + 1;
+                    registration.setWaitlistPosition(position);
+                } else {
+                    // Remove from waitlist
+                    int oldPosition = registration.getWaitlistPosition() != null ? registration.getWaitlistPosition() : 0;
+                    registration.setWaitlistPosition(null);
+                    
+                    if (oldPosition > 0) {
+                        registrationRepository.decrementWaitlistPositionsAfter(workshop, oldPosition);
+                    }
+                }
+                
                 registration.setWaitlist(addToWaitlist);
                 return Optional.of(registrationRepository.save(registration));
             }
@@ -163,6 +425,13 @@ public class WorkshopService {
         registration.setUser(user);
         registration.setRegistrationTime(LocalDateTime.now());
         registration.setWaitlist(addToWaitlist);
+        
+        if (addToWaitlist) {
+            // Set waitlist position
+            Optional<Integer> maxPositionOpt = registrationRepository.findMaxWaitlistPosition(workshop);
+            int position = maxPositionOpt.orElse(0) + 1;
+            registration.setWaitlistPosition(position);
+        }
 
         return Optional.of(registrationRepository.save(registration));
     }
@@ -196,7 +465,13 @@ public class WorkshopService {
             if (workshop != null) {
                 int registeredCount = getWorkshopParticipants(workshop).size();
                 int waitlistCount = getWorkshopWaitlist(workshop).size();
-                results.add(new Object[]{workshop, registeredCount, waitlistCount, reg.isWaitlist()});
+                results.add(new Object[]{
+                    workshop, 
+                    registeredCount, 
+                    waitlistCount, 
+                    reg.isWaitlist(),
+                    reg.getWaitlistPosition()
+                });
             }
         }
         
