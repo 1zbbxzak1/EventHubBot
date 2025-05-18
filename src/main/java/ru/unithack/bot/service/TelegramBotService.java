@@ -6,6 +6,7 @@ import com.pengrad.telegrambot.model.Message;
 import com.pengrad.telegrambot.model.Update;
 import com.pengrad.telegrambot.model.User;
 import com.pengrad.telegrambot.request.SendMessage;
+import com.pengrad.telegrambot.request.SendPhoto;
 import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -33,14 +34,17 @@ public class TelegramBotService {
     private final UserService userService;
     private final RoleService roleService;
     private final UserRepository userRepository;
+    private final QrCodeService qrCodeService;
 
     @Autowired
     public TelegramBotService(UserService userService,
                               RoleService roleService,
-                              UserRepository userRepository) {
+                              UserRepository userRepository,
+                              QrCodeService qrCodeService) {
         this.userService = userService;
         this.roleService = roleService;
         this.userRepository = userRepository;
+        this.qrCodeService = qrCodeService;
     }
 
     @PostConstruct
@@ -85,13 +89,19 @@ public class TelegramBotService {
             processMyRolesCommand(chatId);
         } else if (text.startsWith("/list_users")) {
             processListUsersCommand(chatId);
+        } else if (text.startsWith("/my_qr")) {
+            processMyQrCommand(chatId);
+        } else if (text.startsWith("/user_qr")) {
+            processUserQrCommand(chatId, text);
         } else {
             sendMessage(chatId, "Неизвестная команда. Доступные команды:\n" +
                     "/start - Регистрация пользователя\n" +
                     "/add_organizer <chatId> - Добавить организатора (только для админов)\n" +
                     "/remove_organizer <chatId> - Удалить организатора (только для админов)\n" +
                     "/my_roles - Проверить свои роли\n" +
-                    "/list_users - Список пользователей (только для админов)");
+                    "/list_users - Список пользователей (только для админов)\n" +
+                    "/my_qr - Получить свой QR-код\n" +
+                    "/user_qr <chatId> - Получить QR-код пользователя (только для админов/организаторов)");
         }
     }
 
@@ -256,7 +266,84 @@ public class TelegramBotService {
         );
     }
 
+    @Transactional
+    protected void processMyQrCommand(Long chatId) {
+        userService.findUserByChatId(chatId).ifPresentOrElse(
+                user -> {
+                    UserInfo userInfo = user.getUserInfo();
+                    if (userInfo != null) {
+                        String qrCodeContent = generateQrCodeContent(user);
+                        byte[] qrCodeImage = qrCodeService.generateQrCode(qrCodeContent);
+
+                        if (!qrCodeContent.equals(userInfo.getQrCode())) {
+                            userInfo.setQrCode(qrCodeContent);
+                            userRepository.save(user);
+                        }
+
+                        sendPhoto(chatId, qrCodeImage, "Ваш QR-код");
+                    }
+                },
+                () -> sendMessage(chatId, "Вы не зарегистрированы. Используйте /start для регистрации.")
+        );
+    }
+
+    @Transactional
+    protected void processUserQrCommand(Long chatId, String text) {
+        userService.findUserByChatId(chatId).ifPresentOrElse(
+                currentUser -> {
+                    if (userService.hasRole(currentUser.getId(), UserRole.ADMIN) ||
+                            userService.hasRole(currentUser.getId(), UserRole.ORGANIZER)) {
+
+                        String[] parts = text.split(" ", 2);
+                        if (parts.length > 1 && !parts[1].trim().isEmpty()) {
+                            try {
+                                Long targetChatId = Long.parseLong(parts[1].trim());
+
+                                userService.findUserByChatId(targetChatId).ifPresentOrElse(
+                                        targetUser -> {
+                                            UserInfo targetUserInfo = targetUser.getUserInfo();
+                                            String qrCodeContent = generateQrCodeContent(targetUser);
+                                            byte[] qrCodeImage = qrCodeService.generateQrCode(qrCodeContent);
+
+                                            if (!qrCodeContent.equals(targetUserInfo.getQrCode())) {
+                                                targetUserInfo.setQrCode(qrCodeContent);
+                                                userRepository.save(targetUser);
+                                            }
+
+                                            sendPhoto(chatId, qrCodeImage, "QR-код пользователя " + targetUserInfo.getName());
+                                        },
+                                        () -> sendMessage(chatId, "Пользователь с ID " + targetChatId + " не найден.")
+                                );
+                            } catch (NumberFormatException e) {
+                                sendMessage(chatId, "Пожалуйста, укажите корректный ID чата пользователя: /user_qr <chatId>");
+                            }
+                        } else {
+                            sendMessage(chatId, "Пожалуйста, укажите ID чата пользователя: /user_qr <chatId>");
+                        }
+                    } else {
+                        sendMessage(chatId, "У вас нет прав на выполнение этой команды. Требуется роль администратора или организатора.");
+                    }
+                },
+                () -> sendMessage(chatId, "Вы не зарегистрированы. Используйте /start для регистрации.")
+        );
+    }
+
     private void sendMessage(Long chatId, String text) {
         telegramBot.execute(new SendMessage(chatId, text));
+    }
+
+    /**
+     * Генерирует содержимое QR-кода для пользователя.
+     * Формат: ID:USER_ID:NAME:CHAT_ID
+     */
+    private String generateQrCodeContent(ru.unithack.bot.domain.model.User user) {
+        UserInfo info = user.getUserInfo();
+        return String.format("ID:%d:%s:%d", user.getId(), info.getName(), info.getChatId());
+    }
+
+    private void sendPhoto(Long chatId, byte[] photoData, String caption) {
+        SendPhoto sendPhoto = new SendPhoto(chatId, photoData)
+                .caption(caption);
+        telegramBot.execute(sendPhoto);
     }
 } 
