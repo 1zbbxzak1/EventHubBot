@@ -8,8 +8,10 @@ import com.pengrad.telegrambot.model.User;
 import com.pengrad.telegrambot.model.request.InlineKeyboardButton;
 import com.pengrad.telegrambot.model.request.InlineKeyboardMarkup;
 import com.pengrad.telegrambot.model.request.ParseMode;
+import com.pengrad.telegrambot.request.GetFile;
 import com.pengrad.telegrambot.request.SendMessage;
 import com.pengrad.telegrambot.request.SendPhoto;
+import com.pengrad.telegrambot.response.GetFileResponse;
 import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -18,14 +20,18 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import ru.unithack.bot.domain.enums.UserRole;
+import ru.unithack.bot.domain.model.NewsPost;
 import ru.unithack.bot.domain.model.UserInfo;
 import ru.unithack.bot.domain.model.Workshop;
 import ru.unithack.bot.domain.model.WorkshopRegistration;
 import ru.unithack.bot.infrastructure.repository.UserRepository;
 
+import java.io.IOException;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
@@ -49,18 +55,24 @@ public class TelegramBotService {
     private final UserRepository userRepository;
     private final QrCodeService qrCodeService;
     private final WorkshopService workshopService;
+    private final NewsService newsService;
+    
+    // Map для хранения временных данных создания новостей (chatId -> NewsCreationState)
+    private final Map<Long, NewsCreationState> newsCreationStates = new HashMap<>();
 
     @Autowired
     public TelegramBotService(UserService userService,
                               RoleService roleService,
                               UserRepository userRepository,
                               QrCodeService qrCodeService,
-                              WorkshopService workshopService) {
+                              WorkshopService workshopService,
+                              NewsService newsService) {
         this.userService = userService;
         this.roleService = roleService;
         this.userRepository = userRepository;
         this.qrCodeService = qrCodeService;
         this.workshopService = workshopService;
+        this.newsService = newsService;
     }
 
     @PostConstruct
@@ -279,109 +291,528 @@ public class TelegramBotService {
         );
     }
 
+    /**
+     * Обрабатывает входящие сообщения
+     */
     @Transactional
     protected void processMessage(Message message) {
-        String text = message.text();
+        if (message.text() == null) {
+            processNonTextMessage(message);
+            return;
+        }
+
+        String text = message.text().trim();
         User telegramUser = message.from();
-        Long chatId = message.chat().id();
-        String fullName = (telegramUser.firstName() + " " +
-                (telegramUser.lastName() != null ? telegramUser.lastName() : "")).trim();
+        Long chatId = telegramUser.id();
         String username = telegramUser.username();
+        String firstName = telegramUser.firstName() != null ? telegramUser.firstName() : "";
+        String lastName = telegramUser.lastName() != null ? telegramUser.lastName() : "";
+        String fullName = (firstName + " " + lastName).trim();
+
+        // Обработка состояния создания новости
+        if (newsCreationStates.containsKey(chatId)) {
+            processNewsCreationState(chatId, text, message);
+            return;
+        }
 
         updateUserInfoIfChanged(chatId, fullName, username);
-
+        
+        // Обработка команд
         if (text.startsWith("/start")) {
             processStartCommand(telegramUser, chatId, fullName, username, text);
-        } else if (text.startsWith("/add_organizer")) {
-            processAddOrganizerCommand(chatId, text);
-        } else if (text.startsWith("/remove_organizer")) {
-            processRemoveOrganizerCommand(chatId, text);
-        } else if (text.startsWith("/my_roles")) {
-            processMyRolesCommand(chatId);
-        } else if (text.startsWith("/list_users")) {
-            processListUsersCommand(chatId);
-        } else if (text.startsWith("/my_qr")) {
-            processMyQrCommand(chatId);
-        } else if (text.startsWith("/user_qr")) {
-            processUserQrCommand(chatId, text);
-        } else if (text.startsWith("/help")) {
+        } else if (text.equals("/help")) {
             processHelpCommand(chatId);
-        } else if (text.startsWith("/workshops")) {
+        } else if (text.equals("/my_roles")) {
+            processMyRolesCommand(chatId);
+        } else if (text.equals("/list_users") || text.equals("/users")) {
+            processListUsersCommand(chatId);
+        } else if (text.equals("/my_qr")) {
+            processMyQrCommand(chatId);
+        } else if (text.startsWith("/user_qr ")) {
+            processUserQrCommand(chatId, text);
+        } else if (text.equals("/workshops") || text.equals("/list_workshops")) {
             processListWorkshopsCommand(chatId);
-        } else if (text.startsWith("/workshop_info")) {
+        } else if (text.startsWith("/workshop_info ")) {
             processWorkshopInfoCommand(chatId, text);
-        } else if (text.startsWith("/register_workshop")) {
+        } else if (text.startsWith("/register_workshop ")) {
             processRegisterWorkshopCommand(chatId, text);
-        } else if (text.startsWith("/cancel_workshop")) {
+        } else if (text.startsWith("/cancel_workshop ")) {
             processCancelWorkshopCommand(chatId, text);
-        } else if (text.startsWith("/my_workshops")) {
+        } else if (text.equals("/my_workshops")) {
             processMyWorkshopsCommand(chatId);
-        } else if (text.startsWith("/create_workshop")) {
+        } else if (text.startsWith("/create_workshop ")) {
             processCreateWorkshopCommand(chatId, text);
-        } else if (text.startsWith("/edit_workshop")) {
+        } else if (text.startsWith("/edit_workshop ")) {
             processEditWorkshopCommand(chatId, text);
-        } else if (text.startsWith("/delete_workshop")) {
+        } else if (text.startsWith("/delete_workshop ")) {
             processDeleteWorkshopCommand(chatId, text);
-        } else if (text.startsWith("/workshop_participants")) {
+        } else if (text.startsWith("/workshop_participants ")) {
             processWorkshopParticipantsCommand(chatId, text);
-        } else if (text.startsWith("/add_participant")) {
+        } else if (text.startsWith("/add_participant ")) {
             processAddParticipantCommand(chatId, text);
-        } else if (text.startsWith("/remove_participant")) {
+        } else if (text.startsWith("/remove_participant ")) {
             processRemoveParticipantCommand(chatId, text);
-        } else if (text.startsWith("/confirm_workshop")) {
+        } else if (text.startsWith("/confirm_workshop ")) {
             processConfirmWorkshopCommand(chatId, text);
-        } else if (text.startsWith("/scan_qr")) {
+        } else if (text.startsWith("/scan_qr ")) {
             processScanQrCommand(chatId, text);
-        } else if (text.startsWith("/workshop_attendance")) {
+        } else if (text.startsWith("/add_organizer ")) {
+            processAddOrganizerCommand(chatId, text);
+        } else if (text.startsWith("/remove_organizer ")) {
+            processRemoveOrganizerCommand(chatId, text);
+        } else if (text.startsWith("/workshop_attendance ")) {
             processWorkshopAttendanceCommand(chatId, text);
+        } else if (text.equals("/create_news")) {
+            processCreateNewsCommand(chatId);
+        } else if (text.equals("/create_workshop_news")) {
+            processCreateWorkshopNewsCommand(chatId);
+        } else if (text.equals("/my_news")) {
+            processMyNewsCommand(chatId);
         } else {
-            userService.findUserByChatId(chatId).ifPresentOrElse(
-                    user -> {
-                        StringBuilder commandsBuilder = new StringBuilder("Неизвестная команда. Доступные команды:\n");
-
-                        // Commands available to all users
-                        commandsBuilder.append("/start - Регистрация пользователя\n");
-                        commandsBuilder.append("/my_roles - Проверить свои роли\n");
-                        commandsBuilder.append("/my_qr - Получить свой QR-код\n");
-                        commandsBuilder.append("/help - Показать справку по командам\n");
-
-                        // Workshop commands for all users
-                        commandsBuilder.append("\nМастер-классы:\n");
-                        commandsBuilder.append("/workshops - Список доступных мастер-классов\n");
-                        commandsBuilder.append("/workshop_info <id> - Информация о мастер-классе\n");
-                        commandsBuilder.append("/register_workshop <id> - Записаться на мастер-класс\n");
-                        commandsBuilder.append("/cancel_workshop <id> - Отменить запись на мастер-класс\n");
-                        commandsBuilder.append("/my_workshops - Мои записи на мастер-классы\n");
-                        commandsBuilder.append("/confirm_workshop <id> - Подтвердить участие после получения места из листа ожидания\n");
-
-                        // Commands for ORGANIZER and ADMIN
-                        if (userService.hasRole(user.getId(), UserRole.ORGANIZER) ||
-                                userService.hasRole(user.getId(), UserRole.ADMIN)) {
-                            commandsBuilder.append("\nКоманды организатора:\n");
-                            commandsBuilder.append("/user_qr <chatId> - Получить QR-код пользователя\n");
-                            commandsBuilder.append("/create_workshop - Создать мастер-класс\n");
-                            commandsBuilder.append("/edit_workshop <id> - Редактировать мастер-класс\n");
-                            commandsBuilder.append("/delete_workshop <id> - Удалить мастер-класс\n");
-                            commandsBuilder.append("/workshop_participants <id> - Список участников мастер-класса\n");
-                            commandsBuilder.append("/add_participant <workshop_id> - Добавить участника\n");
-                            commandsBuilder.append("/remove_participant <workshop_id> - Удалить участника\n");
-                            commandsBuilder.append("/scan_qr - Сканировать QR-код участника\n");
-                            commandsBuilder.append("/workshop_attendance <id> - Показать отчет о посещении мастер-класса\n");
-                        }
-
-                        // Commands only for ADMIN
-                        if (userService.hasRole(user.getId(), UserRole.ADMIN)) {
-                            commandsBuilder.append("\nКоманды администратора:\n");
-                            commandsBuilder.append("/add_organizer <chatId> - Добавить организатора\n");
-                            commandsBuilder.append("/remove_organizer <chatId> - Удалить организатора\n");
-                            commandsBuilder.append("/list_users - Список пользователей\n");
-                        }
-
-                        sendMessage(chatId, commandsBuilder.toString());
-                    },
-                    () -> sendMessage(chatId, "Вы не зарегистрированы. Используйте /start для регистрации.")
-            );
+            sendMessage(chatId, "Неизвестная команда. Введите /help для списка доступных команд.");
         }
+    }
+
+    /**
+     * Обрабатывает не текстовые сообщения (фото и т.д.)
+     */
+    private void processNonTextMessage(Message message) {
+        Long chatId = message.chat().id();
+        
+        // Обработка фото для новости
+        if (message.photo() != null && newsCreationStates.containsKey(chatId)) {
+            NewsCreationState state = newsCreationStates.get(chatId);
+            if (state.getStep() == NewsCreationStep.WAITING_FOR_IMAGE) {
+                processNewsImage(chatId, message);
+            } else {
+                sendMessage(chatId, "На данном этапе создания новости не требуется изображение.\n" +
+                         "Пожалуйста, следуйте инструкциям в предыдущем сообщении.");
+            }
+        } else {
+            sendMessage(chatId, "Я не могу обработать этот тип сообщения.");
+        }
+    }
+
+    /**
+     * Обрабатывает фотографию для новости
+     */
+    private void processNewsImage(Long chatId, Message message) {
+        try {
+            // Получаем объект NewsCreationState
+            NewsCreationState state = newsCreationStates.get(chatId);
+            
+            // Получаем наибольшее по размеру фото
+            com.pengrad.telegrambot.model.PhotoSize[] photoSizes = message.photo();
+            com.pengrad.telegrambot.model.PhotoSize largestPhoto = photoSizes[photoSizes.length - 1];
+            
+            // Получаем file_id наибольшего фото
+            String fileId = largestPhoto.fileId();
+            
+            // Получаем информацию о файле из Telegram
+            GetFileResponse fileResponse = telegramBot.execute(new GetFile(fileId));
+            if (!fileResponse.isOk()) {
+                sendMessage(chatId, "Ошибка при получении файла. Пожалуйста, попробуйте другое изображение.");
+                return;
+            }
+            
+            // Получаем путь к файлу
+            com.pengrad.telegrambot.model.File file = fileResponse.file();
+            String filePath = file.filePath();
+            
+            // Формируем URL для скачивания
+            String fileUrl = "https://api.telegram.org/file/bot" + telegramToken + "/" + filePath;
+            
+            // Отправляем сообщение о том, что изображение обрабатывается
+            sendMessage(chatId, "Изображение получено, обрабатываю...");
+            
+            // Скачиваем файл - это должно быть реализовано в отдельном методе
+            byte[] imageData = downloadFileFromUrl(fileUrl);
+            
+            // Сохраняем изображение
+            String savedImagePath;
+            try {
+                savedImagePath = newsService.saveImage(imageData, filePath);
+                // Устанавливаем путь к изображению в состояние
+                state.setImagePath(savedImagePath);
+                
+                // Переходим к следующему шагу
+                if (state.getNewsType() == NewsType.GLOBAL) {
+                    // Для глобальной новости переходим к публикации
+                    publishGlobalNews(chatId, state);
+                } else {
+                    // Для новости мастер-класса запрашиваем ID мастер-класса
+                    state.setStep(NewsCreationStep.WAITING_FOR_WORKSHOP_ID);
+                    sendMessage(chatId, "Введите ID мастер-класса, для которого создаётся новость:");
+                }
+            } catch (IOException e) {
+                logger.error("Error saving news image", e);
+                sendMessage(chatId, "Произошла ошибка при сохранении изображения. Пожалуйста, попробуйте снова.");
+                newsCreationStates.remove(chatId);
+            }
+        } catch (Exception e) {
+            logger.error("Error processing news image", e);
+            sendMessage(chatId, "Произошла ошибка при обработке изображения. Пожалуйста, попробуйте снова.");
+            newsCreationStates.remove(chatId);
+        }
+    }
+    
+    /**
+     * Скачивает файл по URL
+     */
+    private byte[] downloadFileFromUrl(String fileUrl) throws IOException {
+        java.net.URL url = new java.net.URL(fileUrl);
+        try (java.io.InputStream in = url.openStream()) {
+            return in.readAllBytes();
+        }
+    }
+
+    /**
+     * Обрабатывает состояние создания новости
+     */
+    private void processNewsCreationState(Long chatId, String text, Message message) {
+        NewsCreationState state = newsCreationStates.get(chatId);
+        
+        switch (state.getStep()) {
+            case WAITING_FOR_TITLE:
+                state.setTitle(text);
+                state.setStep(NewsCreationStep.WAITING_FOR_CONTENT);
+                sendMessage(chatId, "Введите содержание новости (текст):");
+                break;
+                
+            case WAITING_FOR_CONTENT:
+                state.setContent(text);
+                state.setStep(NewsCreationStep.WAITING_FOR_IMAGE);
+                sendMessage(chatId, "Отправьте изображение для новости (или введите /skip, чтобы пропустить):");
+                break;
+                
+            case WAITING_FOR_IMAGE:
+                if (text.equals("/skip")) {
+                    if (state.getNewsType() == NewsType.GLOBAL) {
+                        publishGlobalNews(chatId, state);
+                    } else {
+                        state.setStep(NewsCreationStep.WAITING_FOR_WORKSHOP_ID);
+                        sendMessage(chatId, "Введите ID мастер-класса, для которого создаётся новость:");
+                    }
+                } else {
+                    sendMessage(chatId, "Пожалуйста, отправьте изображение или введите /skip, чтобы пропустить этот шаг.");
+                }
+                break;
+                
+            case WAITING_FOR_WORKSHOP_ID:
+                try {
+                    Long workshopId = Long.parseLong(text);
+                    workshopService.getWorkshopById(workshopId).ifPresentOrElse(
+                        workshop -> {
+                            state.setWorkshopId(workshopId);
+                            publishWorkshopNews(chatId, state, workshop);
+                        },
+                        () -> sendMessage(chatId, "Мастер-класс с ID " + workshopId + " не найден. Попробуйте снова:")
+                    );
+                } catch (NumberFormatException e) {
+                    sendMessage(chatId, "Пожалуйста, введите корректный ID мастер-класса (число):");
+                }
+                break;
+        }
+    }
+
+    /**
+     * Публикует глобальную новость
+     */
+    private void publishGlobalNews(Long chatId, NewsCreationState state) {
+        userService.findUserByChatId(chatId).ifPresentOrElse(
+            user -> {
+                try {
+                    // Создаем новость
+                    NewsPost newsPost = newsService.createGlobalNews(
+                        state.getTitle(),
+                        state.getContent(),
+                        state.getImagePath(),
+                        user
+                    );
+                    
+                    // Отправляем уведомления пользователям
+                    newsService.notifyAllUsersAboutGlobalNews(newsPost);
+                    
+                    // Отправляем подтверждение создателю
+                    sendMessage(chatId, "✅ Глобальная новость успешно создана и разослана всем пользователям!");
+                    
+                    // Удаляем состояние
+                    newsCreationStates.remove(chatId);
+                } catch (Exception e) {
+                    logger.error("Error creating global news", e);
+                    sendMessage(chatId, "Произошла ошибка при создании новости. Пожалуйста, попробуйте снова.");
+                    newsCreationStates.remove(chatId);
+                }
+            },
+            () -> {
+                sendMessage(chatId, "Пользователь не найден.");
+                newsCreationStates.remove(chatId);
+            }
+        );
+    }
+
+    /**
+     * Публикует новость для мастер-класса
+     */
+    private void publishWorkshopNews(Long chatId, NewsCreationState state, Workshop workshop) {
+        userService.findUserByChatId(chatId).ifPresentOrElse(
+            user -> {
+                try {
+                    // Создаем новость
+                    NewsPost newsPost = newsService.createWorkshopNews(
+                        state.getTitle(),
+                        state.getContent(),
+                        state.getImagePath(),
+                        workshop,
+                        user
+                    );
+                    
+                    // Отправляем уведомления участникам мастер-класса
+                    newsService.notifyWorkshopParticipantsAboutNews(newsPost);
+                    
+                    // Отправляем подтверждение создателю
+                    sendMessage(chatId, "✅ Новость для мастер-класса \"" + workshop.getTitle() + 
+                              "\" успешно создана и разослана всем участникам!");
+                    
+                    // Удаляем состояние
+                    newsCreationStates.remove(chatId);
+                } catch (Exception e) {
+                    logger.error("Error creating workshop news", e);
+                    sendMessage(chatId, "Произошла ошибка при создании новости. Пожалуйста, попробуйте снова.");
+                    newsCreationStates.remove(chatId);
+                }
+            },
+            () -> {
+                sendMessage(chatId, "Пользователь не найден.");
+                newsCreationStates.remove(chatId);
+            }
+        );
+    }
+
+    /**
+     * Обрабатывает команду создания глобальной новости
+     */
+    @Transactional
+    protected void processCreateNewsCommand(Long chatId) {
+        userService.findUserByChatId(chatId).ifPresentOrElse(
+            user -> {
+                // Проверяем, имеет ли пользователь роль ADMIN или ORGANIZER
+                if (!(userService.hasRole(user.getId(), UserRole.ADMIN) || 
+                      userService.hasRole(user.getId(), UserRole.ORGANIZER))) {
+                    sendMessage(chatId, "У вас нет прав для создания новостей.");
+                    return;
+                }
+                
+                // Инициируем процесс создания новости
+                NewsCreationState state = new NewsCreationState();
+                state.setStep(NewsCreationStep.WAITING_FOR_TITLE);
+                state.setNewsType(NewsType.GLOBAL);
+                newsCreationStates.put(chatId, state);
+                
+                sendMessage(chatId, "Создание новости для всех пользователей.\n\n" +
+                        "Введите заголовок новости:");
+            },
+            () -> sendMessage(chatId, "Вы не зарегистрированы в системе.")
+        );
+    }
+
+    /**
+     * Обрабатывает команду создания новости для мастер-класса
+     */
+    @Transactional
+    protected void processCreateWorkshopNewsCommand(Long chatId) {
+        userService.findUserByChatId(chatId).ifPresentOrElse(
+            user -> {
+                // Проверяем, имеет ли пользователь роль ADMIN или ORGANIZER
+                if (!(userService.hasRole(user.getId(), UserRole.ADMIN) || 
+                      userService.hasRole(user.getId(), UserRole.ORGANIZER))) {
+                    sendMessage(chatId, "У вас нет прав для создания новостей.");
+                    return;
+                }
+                
+                // Инициируем процесс создания новости
+                NewsCreationState state = new NewsCreationState();
+                state.setStep(NewsCreationStep.WAITING_FOR_TITLE);
+                state.setNewsType(NewsType.WORKSHOP);
+                newsCreationStates.put(chatId, state);
+                
+                sendMessage(chatId, "Создание новости для мастер-класса.\n\n" +
+                        "Введите заголовок новости:");
+            },
+            () -> sendMessage(chatId, "Вы не зарегистрированы в системе.")
+        );
+    }
+
+    /**
+     * Обрабатывает команду просмотра доступных новостей
+     */
+    @Transactional
+    protected void processMyNewsCommand(Long chatId) {
+        userService.findUserByChatId(chatId).ifPresentOrElse(
+            user -> {
+                List<NewsPost> news = newsService.getRelevantNewsForUser(user);
+                
+                if (news.isEmpty()) {
+                    sendMessage(chatId, "На данный момент нет доступных новостей.");
+                    return;
+                }
+                
+                StringBuilder message = new StringBuilder("Доступные новости:\n\n");
+                
+                for (NewsPost post : news) {
+                    message.append("📢 *").append(post.getTitle()).append("*\n");
+                    message.append(post.getContent().length() > 100 ? 
+                                  post.getContent().substring(0, 97) + "..." : post.getContent())
+                           .append("\n");
+                    
+                    if (!post.isGlobal() && post.getWorkshop() != null) {
+                        message.append("🔹 Мастер-класс: ").append(post.getWorkshop().getTitle()).append("\n");
+                    }
+                    
+                    message.append("🕒 ").append(post.getCreatedAt().format(DATE_TIME_FORMATTER))
+                           .append("\n\n");
+                }
+                
+                sendMessage(chatId, message.toString());
+            },
+            () -> sendMessage(chatId, "Вы не зарегистрированы в системе.")
+        );
+    }
+    
+    /**
+     * Обновляет вывод помощи, добавляя команды для новостей
+     */
+    private void processHelpCommand(Long chatId) {
+        userService.findUserByChatId(chatId).ifPresentOrElse(
+            user -> {
+                StringBuilder help = new StringBuilder();
+                help.append("Доступные команды:\n\n");
+                
+                // Основные команды для всех пользователей
+                help.append("📋 *Основные команды:*\n");
+                help.append("/my_qr - Показать ваш QR-код\n");
+                help.append("/workshops - Список доступных мастер-классов\n");
+                help.append("/workshop_info [id] - Информация о конкретном мастер-классе\n");
+                help.append("/register_workshop [id] - Записаться на мастер-класс\n");
+                help.append("/cancel_workshop [id] - Отменить запись на мастер-класс\n");
+                help.append("/my_workshops - Ваши мастер-классы\n");
+                help.append("/my_roles - Ваши роли в системе\n");
+                help.append("/my_news - Доступные новости\n\n");
+                
+                // Дополнительные команды для организаторов и администраторов
+                if (userService.hasRole(user.getId(), UserRole.ORGANIZER) || 
+                    userService.hasRole(user.getId(), UserRole.ADMIN)) {
+                    help.append("🔧 *Команды для организаторов:*\n");
+                    help.append("/create_workshop [название]|[описание]|[дата]|[время]|[место]|[макс.участников] - Создать мастер-класс\n");
+                    help.append("/edit_workshop [id]|[название]|[описание]|[дата]|[время]|[место]|[макс.участников] - Изменить мастер-класс\n");
+                    help.append("/delete_workshop [id] - Удалить мастер-класс\n");
+                    help.append("/workshop_participants [id] - Список участников мастер-класса\n");
+                    help.append("/add_participant [workshop_id]|[user_id] - Добавить участника на мастер-класс\n");
+                    help.append("/remove_participant [workshop_id]|[user_id] - Удалить участника с мастер-класса\n");
+                    help.append("/workshop_attendance [id] - Отметить присутствие участников мастер-класса\n");
+                    help.append("/scan_qr [qr_content] - Сканировать QR-код участника для отметки присутствия\n");
+                    help.append("/create_news - Создать глобальную новость для всех пользователей\n");
+                    help.append("/create_workshop_news - Создать новость для мастер-класса\n\n");
+                }
+                
+                // Административные команды
+                if (userService.hasRole(user.getId(), UserRole.ADMIN)) {
+                    help.append("🔑 *Административные команды:*\n");
+                    help.append("/users - Список пользователей\n");
+                    help.append("/user_qr [user_id] - Получить QR-код пользователя\n");
+                    help.append("/add_organizer [user_id] - Назначить пользователя организатором\n");
+                    help.append("/remove_organizer [user_id] - Удалить роль организатора у пользователя\n");
+                }
+                
+                sendMessage(chatId, help.toString());
+            },
+            () -> {
+                String message = "Для начала работы с ботом введите команду /start, " +
+                        "чтобы зарегистрироваться в системе.";
+                sendMessage(chatId, message);
+            }
+        );
+    }
+
+    /**
+     * Класс для хранения состояния создания новости
+     */
+    private static class NewsCreationState {
+        private NewsCreationStep step;
+        private NewsType newsType;
+        private String title;
+        private String content;
+        private String imagePath;
+        private Long workshopId;
+        
+        public NewsCreationState() {
+        }
+        
+        public NewsCreationStep getStep() {
+            return step;
+        }
+        
+        public void setStep(NewsCreationStep step) {
+            this.step = step;
+        }
+        
+        public NewsType getNewsType() {
+            return newsType;
+        }
+        
+        public void setNewsType(NewsType newsType) {
+            this.newsType = newsType;
+        }
+        
+        public String getTitle() {
+            return title;
+        }
+        
+        public void setTitle(String title) {
+            this.title = title;
+        }
+        
+        public String getContent() {
+            return content;
+        }
+        
+        public void setContent(String content) {
+            this.content = content;
+        }
+        
+        public String getImagePath() {
+            return imagePath;
+        }
+        
+        public void setImagePath(String imagePath) {
+            this.imagePath = imagePath;
+        }
+        
+        public Long getWorkshopId() {
+            return workshopId;
+        }
+        
+        public void setWorkshopId(Long workshopId) {
+            this.workshopId = workshopId;
+        }
+    }
+    
+    /**
+     * Перечисление для шагов создания новости
+     */
+    private enum NewsCreationStep {
+        WAITING_FOR_TITLE,
+        WAITING_FOR_CONTENT,
+        WAITING_FOR_IMAGE,
+        WAITING_FOR_WORKSHOP_ID
+    }
+    
+    /**
+     * Перечисление для типов новостей
+     */
+    private enum NewsType {
+        GLOBAL,
+        WORKSHOP
     }
 
     private void updateUserInfoIfChanged(Long chatId, String currentName, String username) {
@@ -716,73 +1147,7 @@ public class TelegramBotService {
         );
     }
 
-    private void processHelpCommand(Long chatId) {
-        userService.findUserByChatId(chatId).ifPresentOrElse(
-                user -> {
-                    StringBuilder commandsBuilder = new StringBuilder("Доступные команды:\n");
-
-                    // Commands available to all users
-                    commandsBuilder.append("/start - Регистрация пользователя\n");
-                    commandsBuilder.append("/my_roles - Проверить свои роли\n");
-                    commandsBuilder.append("/my_qr - Получить свой QR-код\n");
-                    commandsBuilder.append("/help - Показать справку по командам\n");
-
-                    // Workshop commands for all users
-                    commandsBuilder.append("\nМастер-классы:\n");
-                    commandsBuilder.append("/workshops - Список доступных мастер-классов\n");
-                    commandsBuilder.append("/workshop_info <id> - Информация о мастер-классе\n");
-                    commandsBuilder.append("/register_workshop <id> - Записаться на мастер-класс\n");
-                    commandsBuilder.append("/cancel_workshop <id> - Отменить запись на мастер-класс\n");
-                    commandsBuilder.append("/my_workshops - Мои записи на мастер-классы\n");
-                    commandsBuilder.append("/confirm_workshop <id> - Подтвердить участие после получения места из листа ожидания\n");
-
-                    // Commands for ORGANIZER and ADMIN
-                    if (userService.hasRole(user.getId(), UserRole.ORGANIZER) ||
-                            userService.hasRole(user.getId(), UserRole.ADMIN)) {
-                        commandsBuilder.append("\nКоманды организатора:\n");
-                        commandsBuilder.append("/user_qr <chatId> - Получить QR-код пользователя\n");
-                        commandsBuilder.append("/create_workshop <title>|<description>|<dd.MM.yyyy>|<HH:mm>|<HH:mm>|<capacity> - Создать мастер-класс\n");
-                        commandsBuilder.append("/edit_workshop <id>|<title>|<description>|<dd.MM.yyyy>|<HH:mm>|<HH:mm>|<capacity>|<active> - Редактировать мастер-класс\n");
-                        commandsBuilder.append("/delete_workshop <id> - Удалить мастер-класс\n");
-                        commandsBuilder.append("/workshop_participants <id> - Список участников мастер-класса\n");
-                        commandsBuilder.append("/add_participant <workshop_id>|<user_chatId>|<waitlist> - Добавить участника\n");
-                        commandsBuilder.append("/remove_participant <workshop_id>|<user_chatId> - Удалить участника\n");
-                        commandsBuilder.append("/scan_qr - Сканировать QR-код участника\n");
-                        commandsBuilder.append("/workshop_attendance <id> - Показать отчет о посещении мастер-класса\n");
-                    }
-
-                    // Commands only for ADMIN
-                    if (userService.hasRole(user.getId(), UserRole.ADMIN)) {
-                        commandsBuilder.append("\nКоманды администратора:\n");
-                        commandsBuilder.append("/add_organizer <chatId> - Добавить организатора\n");
-                        commandsBuilder.append("/remove_organizer <chatId> - Удалить организатора\n");
-                        commandsBuilder.append("/list_users - Список пользователей\n");
-                    }
-
-                    // System info about waitlists
-                    commandsBuilder.append("\nИнформация о листе ожидания:\n");
-                    commandsBuilder.append("✓ Если места на мастер-класс закончились, вы можете записаться в лист ожидания\n");
-                    commandsBuilder.append("✓ При этом вы получите номер в очереди\n");
-                    commandsBuilder.append("✓ При освобождении места первый человек в очереди получит уведомление\n");
-                    commandsBuilder.append("✓ У вас будет 15 минут на подтверждение участия через команду /confirm_workshop\n");
-                    commandsBuilder.append("✓ Если вы не подтвердите участие вовремя, место будет предложено следующему\n");
-                    
-                    // Information about attendance tracking system
-                    if (userService.hasRole(user.getId(), UserRole.ORGANIZER) ||
-                            userService.hasRole(user.getId(), UserRole.ADMIN)) {
-                        commandsBuilder.append("\nОтслеживание посещаемости:\n");
-                        commandsBuilder.append("✓ Для отметки посещения отсканируйте QR-код участника обычным сканером\n");
-                        commandsBuilder.append("✓ QR-код содержит ссылку, которая автоматически откроется в Telegram\n");
-                        commandsBuilder.append("✓ После сканирования вы получите информацию о пользователе и его мастер-классах\n");
-                        commandsBuilder.append("✓ Вы сможете отметить посещение, нажав на кнопку \"Отметить\"\n");
-                        commandsBuilder.append("✓ Для просмотра отчетов используйте команду /workshop_attendance <id>\n");
-                    }
-
-                    sendMessage(chatId, commandsBuilder.toString());
-                },
-                () -> sendMessage(chatId, "Вы не зарегистрированы. Используйте /start для регистрации.")
-        );
-    }
+    
 
     @Transactional
     protected void processListWorkshopsCommand(Long chatId) {

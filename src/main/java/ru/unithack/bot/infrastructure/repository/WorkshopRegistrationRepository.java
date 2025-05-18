@@ -3,6 +3,7 @@ package ru.unithack.bot.infrastructure.repository;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 import ru.unithack.bot.domain.model.User;
 import ru.unithack.bot.domain.model.Workshop;
@@ -43,4 +44,12 @@ public interface WorkshopRegistrationRepository extends JpaRepository<WorkshopRe
     
     @Query("SELECT MAX(r.waitlistPosition) FROM WorkshopRegistration r WHERE r.workshop = :workshop AND r.waitlist = true")
     Optional<Integer> findMaxWaitlistPosition(Workshop workshop);
+    
+    @Query("SELECT DISTINCT ui.chatId FROM UserInfo ui WHERE ui.user.id IN " +
+           "(SELECT u.id FROM User u)")
+    List<Long> findAllUserChatIds();
+    
+    @Query("SELECT r FROM WorkshopRegistration r WHERE r.workshop.id = :workshopId " +
+           "AND r.waitlist = false AND r.pendingConfirmation = false")
+    List<WorkshopRegistration> findConfirmedByWorkshopId(@Param("workshopId") Long workshopId);
 } 
