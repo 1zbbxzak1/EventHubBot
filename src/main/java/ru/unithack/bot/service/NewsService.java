@@ -204,7 +204,7 @@ public class NewsService {
      * Получает все релевантные новости для пользователя
      * (глобальные + новости мастер-классов, на которые он записан)
      */
-    @Transactional(readOnly = true)
+    @Transactional
     public List<NewsPost> getRelevantNewsForUser(User user) {
         return newsPostRepository.findAllRelevantForUser(user);
     }
