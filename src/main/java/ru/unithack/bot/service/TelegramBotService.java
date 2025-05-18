@@ -129,6 +129,8 @@ public class TelegramBotService {
                         return;
                     }
                     
+                    // Используем переданный статус из колбэка (теперь всегда true)
+                    
                     workshopService.getWorkshopById(workshopId).ifPresentOrElse(
                             workshop -> {
                                 userService.findUserById(userId).ifPresentOrElse(
@@ -207,8 +209,6 @@ public class TelegramBotService {
             processConfirmWorkshopCommand(chatId, text);
         } else if (text.startsWith("/scan_qr")) {
             processScanQrCommand(chatId, text);
-        } else if (text.startsWith("/mark_attendance")) {
-            processMarkAttendanceCommand(chatId, text);
         } else if (text.startsWith("/workshop_attendance")) {
             processWorkshopAttendanceCommand(chatId, text);
         } else {
@@ -243,7 +243,6 @@ public class TelegramBotService {
                             commandsBuilder.append("/add_participant <workshop_id> - Добавить участника\n");
                             commandsBuilder.append("/remove_participant <workshop_id> - Удалить участника\n");
                             commandsBuilder.append("/scan_qr - Сканировать QR-код участника\n");
-                            commandsBuilder.append("/mark_attendance <workshop_id>|<user_id>|<status> - Отметить посещение участника\n");
                             commandsBuilder.append("/workshop_attendance <id> - Показать отчет о посещении мастер-класса\n");
                         }
 
@@ -375,14 +374,30 @@ public class TelegramBotService {
                                             ));
                                         }
 
-                                        sb.append("Для быстрой отметки присутствия используйте команду:\n")
-                                                .append("/mark_attendance ")
-                                                .append(registrations.get(0).getWorkshop().getId())
-                                                .append("|")
-                                                .append(userId)
-                                                .append("|true");
-
-                                        sendMessage(organizerChatId, sb.toString());
+                                        // Создаем сообщение
+                                        SendMessage message = new SendMessage(organizerChatId, sb.toString());
+                                        
+                                        // Создаем клавиатуру с inline кнопками для каждого мастер-класса
+                                        InlineKeyboardMarkup keyboardMarkup = new InlineKeyboardMarkup();
+                                        InlineKeyboardButton[] buttons = new InlineKeyboardButton[registrations.size()];
+                                        
+                                        for (int i = 0; i < registrations.size(); i++) {
+                                            Workshop workshop = registrations.get(i).getWorkshop();
+                                            // Используем true в качестве стандартного статуса
+                                            buttons[i] = new InlineKeyboardButton("Отметить - " + workshop.getTitle())
+                                                    .callbackData("mark_attendance:" + workshop.getId() + ":" + userId + ":true");
+                                        }
+                                        
+                                        // Добавляем по одной кнопке в ряду
+                                        for (InlineKeyboardButton button : buttons) {
+                                            keyboardMarkup.addRow(button);
+                                        }
+                                        
+                                        // Прикрепляем клавиатуру к сообщению
+                                        message.replyMarkup(keyboardMarkup);
+                                        
+                                        // Отправляем сообщение с клавиатурой
+                                        telegramBot.execute(message);
                                     } else {
                                         sendMessage(organizerChatId, "Пользователь найден, но информация о нем отсутствует.");
                                     }
@@ -610,7 +625,6 @@ public class TelegramBotService {
                         commandsBuilder.append("/add_participant <workshop_id>|<user_chatId>|<waitlist> - Добавить участника\n");
                         commandsBuilder.append("/remove_participant <workshop_id>|<user_chatId> - Удалить участника\n");
                         commandsBuilder.append("/scan_qr - Сканировать QR-код участника\n");
-                        commandsBuilder.append("/mark_attendance <workshop_id>|<user_id>|<status> - Отметить посещение участника\n");
                         commandsBuilder.append("/workshop_attendance <id> - Показать отчет о посещении мастер-класса\n");
                     }
 
@@ -637,8 +651,7 @@ public class TelegramBotService {
                         commandsBuilder.append("✓ Для отметки посещения отсканируйте QR-код участника обычным сканером\n");
                         commandsBuilder.append("✓ QR-код содержит ссылку, которая автоматически откроется в Telegram\n");
                         commandsBuilder.append("✓ После сканирования вы получите информацию о пользователе и его мастер-классах\n");
-                        commandsBuilder.append("✓ Вы сможете отметить посещение, нажав на предложенную команду\n");
-                        commandsBuilder.append("✓ Также можно вручную отметить посещение командой /mark_attendance\n");
+                        commandsBuilder.append("✓ Вы сможете отметить посещение, нажав на кнопку \"Отметить\"\n");
                         commandsBuilder.append("✓ Для просмотра отчетов используйте команду /workshop_attendance <id>\n");
                     }
 
@@ -1442,103 +1455,6 @@ public class TelegramBotService {
                             },
                             () -> sendMessage(chatId, "QR-код не распознан или пользователь не найден. Проверьте формат и попробуйте еще раз.")
                     );
-                },
-                () -> sendMessage(chatId, "Вы не зарегистрированы. Используйте /start для регистрации.")
-        );
-    }
-
-    /**
-     * Обрабатывает команду отметки посещения
-     */
-    @Transactional
-    protected void processMarkAttendanceCommand(Long chatId, String text) {
-        userService.findUserByChatId(chatId).ifPresentOrElse(
-                organizer -> {
-                    if (!(userService.hasRole(organizer.getId(), UserRole.ORGANIZER) ||
-                            userService.hasRole(organizer.getId(), UserRole.ADMIN))) {
-                        sendMessage(chatId, "У вас нет прав на выполнение этой команды. Требуется роль организатора или администратора.");
-                        return;
-                    }
-
-                    // Проверяем, это начальная команда или уже содержит параметры
-                    if (text.trim().equals("/mark_attendance")) {
-                        sendMessage(chatId, "Для отметки посещения используйте формат:\n" +
-                                "/mark_attendance <workshop_id>|<user_id>|<status>\n\n" +
-                                "Где:\n" +
-                                "<workshop_id> - ID мастер-класса\n" +
-                                "<user_id> - ID пользователя (можно получить после сканирования QR-кода)\n" +
-                                "<status> - статус посещения (true - присутствовал, false - не присутствовал)");
-                        return;
-                    }
-
-                    try {
-                        String paramString = text.substring("/mark_attendance".length()).trim();
-                        String[] params = paramString.split("\\|");
-
-                        // Проверяем, хватает ли параметров
-                        if (params.length < 3) {
-                            // Попытка обработать краткий формат с двумя параметрами (workshop_id|status)
-                            if (params.length == 2) {
-                                try {
-                                    Long workshopId = Long.parseLong(params[0].trim());
-                                    boolean status = Boolean.parseBoolean(params[1].trim());
-                                    
-                                    // Здесь предполагаем, что это продолжение команды scan_qr
-                                    // и пользователь уже выбран. Получаем последнего сканированного пользователя
-                                    // из временного хранилища или из контекста сессии.
-                                    
-                                    // TODO: Для полной реализации требуется сохранение контекста сессии пользователя
-                                    // Пока делаем простую проверку по параметрам
-                                    sendMessage(chatId, "Пожалуйста, укажите ID пользователя: /mark_attendance " + 
-                                            workshopId + "|<user_id>|" + status);
-                                    return;
-                                } catch (Exception e) {
-                                    sendMessage(chatId, "Некорректный формат параметров.");
-                                    return;
-                                }
-                            } else {
-                                sendMessage(chatId, "Недостаточно параметров. Используйте формат:\n" +
-                                        "/mark_attendance <workshop_id>|<user_id>|<status>");
-                                return;
-                            }
-                        }
-
-                        // Разбираем параметры
-                        Long workshopId = Long.parseLong(params[0].trim());
-                        Long userId = Long.parseLong(params[1].trim());
-                        boolean attended = Boolean.parseBoolean(params[2].trim());
-
-                        // Находим мастер-класс
-                        workshopService.getWorkshopById(workshopId).ifPresentOrElse(
-                                workshop -> {
-                                    // Находим пользователя
-                                    userService.findUserById(userId).ifPresentOrElse(
-                                            participant -> {
-                                                // Отмечаем посещение
-                                                boolean success = workshopService.markAttendance(workshop, participant, attended, organizer.getId());
-                                                if (success) {
-                                                    String status = attended ? "отмечен как присутствующий" : "отмечен как отсутствующий";
-                                                    sendMessage(chatId, String.format("Участник %s %s на мастер-классе \"%s\".",
-                                                            participant.getUserInfo().getName(),
-                                                            status,
-                                                            workshop.getTitle()));
-                                                } else {
-                                                    sendMessage(chatId, String.format("Не удалось отметить посещение. Возможно, %s не зарегистрирован на мастер-класс \"%s\" или находится в листе ожидания.",
-                                                            participant.getUserInfo().getName(),
-                                                            workshop.getTitle()));
-                                                }
-                                            },
-                                            () -> sendMessage(chatId, "Пользователь с ID " + userId + " не найден.")
-                                    );
-                                },
-                                () -> sendMessage(chatId, "Мастер-класс с ID " + workshopId + " не найден.")
-                        );
-                    } catch (NumberFormatException e) {
-                        sendMessage(chatId, "Некорректный формат ID. Проверьте параметры.");
-                    } catch (Exception e) {
-                        logger.error("Error marking attendance", e);
-                        sendMessage(chatId, "Произошла ошибка при отметке посещения. Проверьте формат ввода.");
-                    }
                 },
                 () -> sendMessage(chatId, "Вы не зарегистрированы. Используйте /start для регистрации.")
         );
