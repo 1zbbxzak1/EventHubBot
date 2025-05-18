@@ -17,8 +17,14 @@ public class UserInfo {
     @Column(name = "name")
     private String name;
 
+    @Column(name = "username")
+    private String username;
+
     @Column(name = "qr_code")
     private String qrCode;
+
+    @Column(name = "chat_id")
+    private Long chatId;
 
     @Column(name = "created_at", nullable = false)
     private ZonedDateTime createdAt;
@@ -91,12 +97,28 @@ public class UserInfo {
         this.name = name;
     }
 
+    public String getUsername() {
+        return username;
+    }
+
+    public void setUsername(String username) {
+        this.username = username;
+    }
+
     public String getQrCode() {
         return qrCode;
     }
 
     public void setQrCode(String qrCode) {
         this.qrCode = qrCode;
+    }
+
+    public Long getChatId() {
+        return chatId;
+    }
+
+    public void setChatId(Long chatId) {
+        this.chatId = chatId;
     }
 
     public ZonedDateTime getCreatedAt() {
