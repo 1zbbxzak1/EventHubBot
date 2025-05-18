@@ -93,6 +93,8 @@ public class TelegramBotService {
             processMyQrCommand(chatId);
         } else if (text.startsWith("/user_qr")) {
             processUserQrCommand(chatId, text);
+        } else if (text.startsWith("/help")) {
+            processHelpCommand(chatId);
         } else {
             userService.findUserByChatId(chatId).ifPresentOrElse(
                     user -> {
@@ -102,6 +104,7 @@ public class TelegramBotService {
                         commandsBuilder.append("/start - Регистрация пользователя\n");
                         commandsBuilder.append("/my_roles - Проверить свои роли\n");
                         commandsBuilder.append("/my_qr - Получить свой QR-код\n");
+                        commandsBuilder.append("/help - Показать справку по командам\n");
                         
                         // Commands for ORGANIZER and ADMIN
                         if (userService.hasRole(user.getId(), UserRole.ORGANIZER) || 
@@ -341,6 +344,36 @@ public class TelegramBotService {
                     } else {
                         sendMessage(chatId, "У вас нет прав на выполнение этой команды. Требуется роль администратора или организатора.");
                     }
+                },
+                () -> sendMessage(chatId, "Вы не зарегистрированы. Используйте /start для регистрации.")
+        );
+    }
+
+    private void processHelpCommand(Long chatId) {
+        userService.findUserByChatId(chatId).ifPresentOrElse(
+                user -> {
+                    StringBuilder commandsBuilder = new StringBuilder("Доступные команды:\n");
+                    
+                    // Commands available to all users
+                    commandsBuilder.append("/start - Регистрация пользователя\n");
+                    commandsBuilder.append("/my_roles - Проверить свои роли\n");
+                    commandsBuilder.append("/my_qr - Получить свой QR-код\n");
+                    commandsBuilder.append("/help - Показать справку по командам\n");
+                    
+                    // Commands for ORGANIZER and ADMIN
+                    if (userService.hasRole(user.getId(), UserRole.ORGANIZER) || 
+                            userService.hasRole(user.getId(), UserRole.ADMIN)) {
+                        commandsBuilder.append("/user_qr <chatId> - Получить QR-код пользователя\n");
+                    }
+                    
+                    // Commands only for ADMIN
+                    if (userService.hasRole(user.getId(), UserRole.ADMIN)) {
+                        commandsBuilder.append("/add_organizer <chatId> - Добавить организатора\n");
+                        commandsBuilder.append("/remove_organizer <chatId> - Удалить организатора\n");
+                        commandsBuilder.append("/list_users - Список пользователей\n");
+                    }
+                    
+                    sendMessage(chatId, commandsBuilder.toString());
                 },
                 () -> sendMessage(chatId, "Вы не зарегистрированы. Используйте /start для регистрации.")
         );
