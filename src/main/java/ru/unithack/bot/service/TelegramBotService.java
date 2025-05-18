@@ -114,6 +114,42 @@ public class TelegramBotService {
                     sendMessage(chatId, "Ошибка при обработке запроса на отметку посещения");
                 }
             }
+        } else if (callbackData.startsWith("register_workshop:")) {
+            // Формат: register_workshop:workshop_id
+            String[] parts = callbackData.split(":");
+            if (parts.length >= 2) {
+                try {
+                    Long workshopId = Long.parseLong(parts[1]);
+                    registerWorkshopFromCallback(chatId, workshopId);
+                } catch (Exception e) {
+                    logger.error("Error processing register_workshop callback", e);
+                    sendMessage(chatId, "Ошибка при обработке запроса на запись на мастер-класс");
+                }
+            }
+        } else if (callbackData.startsWith("cancel_workshop:")) {
+            // Формат: cancel_workshop:workshop_id
+            String[] parts = callbackData.split(":");
+            if (parts.length >= 2) {
+                try {
+                    Long workshopId = Long.parseLong(parts[1]);
+                    cancelWorkshopFromCallback(chatId, workshopId);
+                } catch (Exception e) {
+                    logger.error("Error processing cancel_workshop callback", e);
+                    sendMessage(chatId, "Ошибка при обработке запроса на отмену записи на мастер-класс");
+                }
+            }
+        } else if (callbackData.startsWith("confirm_workshop:")) {
+            // Формат: confirm_workshop:workshop_id
+            String[] parts = callbackData.split(":");
+            if (parts.length >= 2) {
+                try {
+                    Long workshopId = Long.parseLong(parts[1]);
+                    confirmWorkshopFromCallback(chatId, workshopId);
+                } catch (Exception e) {
+                    logger.error("Error processing confirm_workshop callback", e);
+                    sendMessage(chatId, "Ошибка при обработке запроса на подтверждение записи на мастер-класс");
+                }
+            }
         }
     }
     
@@ -153,6 +189,93 @@ public class TelegramBotService {
                     );
                 },
                 () -> sendMessage(organizerChatId, "Вы не зарегистрированы в системе")
+        );
+    }
+    
+    /**
+     * Обрабатывает запись на мастер-класс из колбэка кнопки
+     */
+    @Transactional
+    private void registerWorkshopFromCallback(Long chatId, Long workshopId) {
+        userService.findUserByChatId(chatId).ifPresentOrElse(
+                user -> {
+                    workshopService.getWorkshopById(workshopId).ifPresentOrElse(
+                            workshop -> {
+                                if (!workshop.isActive()) {
+                                    sendMessage(chatId, "Мастер-класс неактивен или отменен.");
+                                    return;
+                                }
+
+                                workshopService.registerParticipant(workshop, user).ifPresentOrElse(
+                                        registration -> {
+                                            if (registration.isWaitlist()) {
+                                                sendMessage(chatId, "Вы добавлены в лист ожидания на мастер-класс \"" +
+                                                        workshop.getTitle() + "\".");
+                                            } else {
+                                                sendMessage(chatId, "Вы успешно записаны на мастер-класс \"" +
+                                                        workshop.getTitle() + "\".");
+                                            }
+                                        },
+                                        () -> sendMessage(chatId, "Вы уже записаны на этот мастер-класс.")
+                                );
+                            },
+                            () -> sendMessage(chatId, "Мастер-класс с ID " + workshopId + " не найден.")
+                    );
+                },
+                () -> sendMessage(chatId, "Вы не зарегистрированы. Используйте /start для регистрации.")
+        );
+    }
+    
+    /**
+     * Обрабатывает отмену записи на мастер-класс из колбэка кнопки
+     */
+    @Transactional
+    private void cancelWorkshopFromCallback(Long chatId, Long workshopId) {
+        userService.findUserByChatId(chatId).ifPresentOrElse(
+                user -> {
+                    workshopService.getWorkshopById(workshopId).ifPresentOrElse(
+                            workshop -> {
+                                boolean success = workshopService.cancelRegistration(workshop, user);
+                                if (success) {
+                                    sendMessage(chatId, "Запись на мастер-класс \"" +
+                                            workshop.getTitle() + "\" успешно отменена.");
+                                } else {
+                                    sendMessage(chatId, "Вы не записаны на этот мастер-класс.");
+                                }
+                            },
+                            () -> sendMessage(chatId, "Мастер-класс с ID " + workshopId + " не найден.")
+                    );
+                },
+                () -> sendMessage(chatId, "Вы не зарегистрированы. Используйте /start для регистрации.")
+        );
+    }
+    
+    /**
+     * Обрабатывает подтверждение записи на мастер-класс из колбэка кнопки
+     */
+    @Transactional
+    private void confirmWorkshopFromCallback(Long chatId, Long workshopId) {
+        userService.findUserByChatId(chatId).ifPresentOrElse(
+                user -> {
+                    workshopService.getWorkshopById(workshopId).ifPresentOrElse(
+                            workshop -> {
+                                if (!workshop.isActive()) {
+                                    sendMessage(chatId, "Мастер-класс неактивен или отменен.");
+                                    return;
+                                }
+
+                                boolean confirmed = workshopService.confirmWorkshopRegistration(workshop, user);
+                                if (confirmed) {
+                                    sendMessage(chatId, "Вы успешно подтвердили участие в мастер-классе \"" +
+                                            workshop.getTitle() + "\".");
+                                } else {
+                                    sendMessage(chatId, "Не удалось подтвердить участие. Возможно, вы не находитесь в листе ожидания или срок подтверждения истек.");
+                                }
+                            },
+                            () -> sendMessage(chatId, "Мастер-класс с ID " + workshopId + " не найден.")
+                    );
+                },
+                () -> sendMessage(chatId, "Вы не зарегистрированы. Используйте /start для регистрации.")
         );
     }
 
@@ -672,13 +795,51 @@ public class TelegramBotService {
                     }
 
                     StringBuilder sb = new StringBuilder("Доступные мастер-классы:\n\n");
+                    
+                    // Получаем регистрации пользователя для проверки статуса
+                    List<WorkshopRegistration> userRegistrations = workshopService.getUserRegistrations(user);
+                    
+                    // Создаем клавиатуру с inline кнопками для каждого мастер-класса
+                    InlineKeyboardMarkup keyboardMarkup = new InlineKeyboardMarkup();
+                    
                     for (Workshop workshop : workshops) {
                         int registeredCount = workshopService.getWorkshopParticipants(workshop).size();
-                        sb.append(workshopService.formatWorkshopListItemSafe(workshop, registeredCount)).append("\n");
+                        sb.append(workshopService.formatWorkshopListItemSafe(workshop, registeredCount)).append("\n\n");
+                        
+                        // Проверяем статус регистрации пользователя на этот мастер-класс
+                        boolean isRegistered = false;
+                        boolean isInWaitlist = false;
+                        
+                        for (WorkshopRegistration reg : userRegistrations) {
+                            if (reg.getWorkshop().getId().equals(workshop.getId())) {
+                                if (reg.isWaitlist()) {
+                                    isInWaitlist = true;
+                                } else {
+                                    isRegistered = true;
+                                }
+                                break;
+                            }
+                        }
+                        
+                        // Добавляем соответствующую кнопку для этого мастер-класса
+                        InlineKeyboardButton button;
+                        if (isRegistered || isInWaitlist) {
+                            button = new InlineKeyboardButton("❌ Отменить - " + workshop.getTitle())
+                                    .callbackData("cancel_workshop:" + workshop.getId());
+                        } else {
+                            button = new InlineKeyboardButton("✅ Записаться - " + workshop.getTitle())
+                                    .callbackData("register_workshop:" + workshop.getId());
+                        }
+                        
+                        keyboardMarkup.addRow(button);
                     }
+                    
                     sb.append("\nДля получения подробной информации используйте команду /workshop_info <id>");
-
-                    sendMessage(chatId, sb.toString());
+                    
+                    // Создаем и отправляем сообщение с кнопками
+                    SendMessage message = new SendMessage(chatId, sb.toString());
+                    message.replyMarkup(keyboardMarkup);
+                    telegramBot.execute(message);
                 },
                 () -> sendMessage(chatId, "Вы не зарегистрированы. Используйте /start для регистрации.")
         );
@@ -701,7 +862,57 @@ public class TelegramBotService {
                                     int registeredCount = workshopService.getWorkshopParticipants(workshop).size();
                                     int waitlistCount = workshopService.getWorkshopWaitlist(workshop).size();
                                     String info = workshopService.formatWorkshopInfoSafe(workshop, registeredCount, waitlistCount);
-                                    sendMessage(chatId, info);
+                                    
+                                    // Проверяем статус регистрации пользователя
+                                    List<WorkshopRegistration> userRegistrations = workshopService.getUserRegistrations(user);
+                                    boolean isRegistered = false;
+                                    boolean isInWaitlist = false;
+                                    boolean canConfirm = false;
+                                    
+                                    for (WorkshopRegistration reg : userRegistrations) {
+                                        if (reg.getWorkshop().getId().equals(workshop.getId())) {
+                                            if (reg.isWaitlist()) {
+                                                isInWaitlist = true;
+                                                // Для простоты: предполагаем, что пользователь может подтвердить участие, 
+                                                // если он в листе ожидания. Точная логика должна быть реализована 
+                                                // в workshopService.confirmWorkshopRegistration
+                                                canConfirm = true;
+                                            } else {
+                                                isRegistered = true;
+                                            }
+                                            break;
+                                        }
+                                    }
+                                    
+                                    // Создаем сообщение с кнопками
+                                    SendMessage message = new SendMessage(chatId, info);
+                                    InlineKeyboardMarkup keyboardMarkup = new InlineKeyboardMarkup();
+                                    
+                                    // Добавляем соответствующие кнопки в зависимости от статуса пользователя
+                                    if (isRegistered || isInWaitlist) {
+                                        // Пользователь уже зарегистрирован - показываем кнопку отмены
+                                        InlineKeyboardButton cancelButton = new InlineKeyboardButton("Отменить запись")
+                                                .callbackData("cancel_workshop:" + workshop.getId());
+                                        keyboardMarkup.addRow(cancelButton);
+                                        
+                                        if (canConfirm) {
+                                            // Пользователь в листе ожидания и может подтвердить участие
+                                            InlineKeyboardButton confirmButton = new InlineKeyboardButton("Подтвердить участие")
+                                                    .callbackData("confirm_workshop:" + workshop.getId());
+                                            keyboardMarkup.addRow(confirmButton);
+                                        }
+                                    } else if (workshop.isActive()) {
+                                        // Пользователь не зарегистрирован - показываем кнопку записи
+                                        InlineKeyboardButton registerButton = new InlineKeyboardButton("Записаться")
+                                                .callbackData("register_workshop:" + workshop.getId());
+                                        keyboardMarkup.addRow(registerButton);
+                                    }
+                                    
+                                    // Прикрепляем клавиатуру к сообщению
+                                    message.replyMarkup(keyboardMarkup);
+                                    
+                                    // Отправляем сообщение с кнопками
+                                    telegramBot.execute(message);
                                 },
                                 () -> sendMessage(chatId, "Мастер-класс с ID " + workshopId + " не найден.")
                         );
@@ -798,6 +1009,10 @@ public class TelegramBotService {
                     }
 
                     StringBuilder sb = new StringBuilder("Ваши записи на мастер-классы:\n\n");
+                    
+                    // Создаем клавиатуру с inline кнопками
+                    InlineKeyboardMarkup keyboardMarkup = new InlineKeyboardMarkup();
+                    
                     for (Object[] data : workshopsWithCounts) {
                         Workshop workshop = (Workshop) data[0];
                         int registeredCount = (int) data[1];
@@ -814,11 +1029,27 @@ public class TelegramBotService {
                             }
                         }
 
-                        sb.append("\n");
+                        sb.append("\n\n");
+                        
+                        // Добавляем кнопку отмены для каждого мастер-класса
+                        InlineKeyboardButton cancelButton = new InlineKeyboardButton("❌ Отменить - " + workshop.getTitle())
+                                .callbackData("cancel_workshop:" + workshop.getId());
+                        keyboardMarkup.addRow(cancelButton);
+                        
+                        // Если пользователь в листе ожидания и может подтвердить участие, добавляем кнопку подтверждения
+                        // Здесь предполагаем простую логику: если в листе ожидания, то может подтвердить
+                        // Настоящую логику подтверждения после приглашения нужно реализовать в методе confirmWorkshopFromCallback
+                        if (isWaitlist) {
+                            InlineKeyboardButton confirmButton = new InlineKeyboardButton("✅ Подтвердить - " + workshop.getTitle())
+                                    .callbackData("confirm_workshop:" + workshop.getId());
+                            keyboardMarkup.addRow(confirmButton);
+                        }
                     }
 
-                    sb.append("\nДля отмены записи используйте команду /cancel_workshop <id>");
-                    sendMessage(chatId, sb.toString());
+                    // Создаем и отправляем сообщение с кнопками
+                    SendMessage message = new SendMessage(chatId, sb.toString());
+                    message.replyMarkup(keyboardMarkup);
+                    telegramBot.execute(message);
                 },
                 () -> sendMessage(chatId, "Вы не зарегистрированы. Используйте /start для регистрации.")
         );
