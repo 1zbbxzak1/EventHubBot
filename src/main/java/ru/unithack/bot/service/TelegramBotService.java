@@ -94,14 +94,32 @@ public class TelegramBotService {
         } else if (text.startsWith("/user_qr")) {
             processUserQrCommand(chatId, text);
         } else {
-            sendMessage(chatId, "Неизвестная команда. Доступные команды:\n" +
-                    "/start - Регистрация пользователя\n" +
-                    "/add_organizer <chatId> - Добавить организатора (только для админов)\n" +
-                    "/remove_organizer <chatId> - Удалить организатора (только для админов)\n" +
-                    "/my_roles - Проверить свои роли\n" +
-                    "/list_users - Список пользователей (только для админов)\n" +
-                    "/my_qr - Получить свой QR-код\n" +
-                    "/user_qr <chatId> - Получить QR-код пользователя (только для админов/организаторов)");
+            userService.findUserByChatId(chatId).ifPresentOrElse(
+                    user -> {
+                        StringBuilder commandsBuilder = new StringBuilder("Неизвестная команда. Доступные команды:\n");
+                        
+                        // Commands available to all users
+                        commandsBuilder.append("/start - Регистрация пользователя\n");
+                        commandsBuilder.append("/my_roles - Проверить свои роли\n");
+                        commandsBuilder.append("/my_qr - Получить свой QR-код\n");
+                        
+                        // Commands for ORGANIZER and ADMIN
+                        if (userService.hasRole(user.getId(), UserRole.ORGANIZER) || 
+                                userService.hasRole(user.getId(), UserRole.ADMIN)) {
+                            commandsBuilder.append("/user_qr <chatId> - Получить QR-код пользователя\n");
+                        }
+                        
+                        // Commands only for ADMIN
+                        if (userService.hasRole(user.getId(), UserRole.ADMIN)) {
+                            commandsBuilder.append("/add_organizer <chatId> - Добавить организатора\n");
+                            commandsBuilder.append("/remove_organizer <chatId> - Удалить организатора\n");
+                            commandsBuilder.append("/list_users - Список пользователей\n");
+                        }
+                        
+                        sendMessage(chatId, commandsBuilder.toString());
+                    },
+                    () -> sendMessage(chatId, "Вы не зарегистрированы. Используйте /start для регистрации.")
+            );
         }
     }
 
